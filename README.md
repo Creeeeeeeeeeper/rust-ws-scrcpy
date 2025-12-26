@@ -1,10 +1,20 @@
 **开发者前言：**
 
-**本程序是我在开发apk一体自动化分析项目时的一个其中一个模块，目前仅支持投屏和鼠标单点操控功能，其他功能暂时不需要实现就没做。代码仅供学习，有很多不完善的地方望多指教！**
+**本程序是我在开发apk一体自动化分析项目时的一个其中一个模块，目前仅支持投屏和鼠标单点操控功能，其他功能暂时不需要实现就没做，代码仅供学习。**
 
-🚩其他依赖：**adb**（任意版本），**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对），需要浏览器支持**Webcodecs API**，否则无法在浏览器看到画面🚩*adb和scrcpy-server注意路径，--help中会有提示*
+其他依赖：**adb**（任意版本），**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对），需要浏览器支持**Webcodecs API**，否则无法在浏览器看到画面。*adb和scrcpy-server注意路径，--help中会有提示*
 
-<img width="200" height="300" alt="image" src="https://github.com/user-attachments/assets/4f6ab07c-c84e-43bc-a889-0d07eb22db18" />
+<p align="center">
+  <img width="220"
+       src="https://github.com/user-attachments/assets/4f6ab07c-c84e-43bc-a889-0d07eb22db18" />
+</p>
+
+<p align="center">
+  <sub>🦀 Rust grabs Android 🤖</sub><br/>
+  <sub style="color: #6a737d;">
+    and talks to it through scrcpy & WebSocket
+  </sub>
+</p>
 
 
 ## 目录
