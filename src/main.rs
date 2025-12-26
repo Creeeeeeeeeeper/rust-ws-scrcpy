@@ -253,7 +253,10 @@ async fn main() -> Result<()> {
     let ws_server = WebSocketServer::new(args.ws_port, idr_request_tx, control_tx, device_width, device_height)?;
     let actual_ws_port = ws_server.get_actual_port();
     let frame_sender = ws_server.get_sender();
+<<<<<<< HEAD
     let config_sender = ws_server.get_config_sender();
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     let video_config = ws_server.get_video_config();
 
     // 显示实际使用的端口信息
@@ -335,7 +338,11 @@ async fn main() -> Result<()> {
 
                             // 缓存 SPS/PPS
                             let nal_type = frame.data[0] & 0x1F;
+<<<<<<< HEAD
                             if nal_type == 7 {
+=======
+                            if nal_type == 7 && !sps_cached {
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
                                 // SPS - 从中解析分辨率
                                 let mut nal_with_start_code = vec![0x00, 0x00, 0x00, 0x01];
                                 nal_with_start_code.extend_from_slice(&frame.data);
@@ -343,6 +350,7 @@ async fn main() -> Result<()> {
                                 let mut config = video_config.write().await;
                                 config.sps = Some(Bytes::from(nal_with_start_code.clone()));
 
+<<<<<<< HEAD
                                 // 解析 SPS 获取分辨率，检测横竖屏变化
                                 let mut should_broadcast = false;
                                 if let Some((width, height)) = parse_sps_resolution(&frame.data) {
@@ -374,6 +382,18 @@ async fn main() -> Result<()> {
                                     info!("✅ SPS cached ({} bytes)", nal_with_start_code.len());
                                     sps_cached = true;
                                 }
+=======
+                                // 简单解析 SPS 获取分辨率
+                                if let Some((width, height)) = parse_sps_resolution(&frame.data) {
+                                    config.width = width;
+                                    config.height = height;
+                                    info!("📐 Parsed resolution from SPS: {}x{}", width, height);
+                                }
+                                drop(config);
+
+                                info!("✅ SPS cached ({} bytes)", nal_with_start_code.len());
+                                sps_cached = true;
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
                             } else if nal_type == 8 && !pps_cached {
                                 // PPS
                                 let mut nal_with_start_code = vec![0x00, 0x00, 0x00, 0x01];

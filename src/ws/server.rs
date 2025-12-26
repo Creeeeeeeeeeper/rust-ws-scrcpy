@@ -22,7 +22,10 @@ pub struct VideoConfig {
     pub height: u32,          // 视频流分辨率（可能经过缩放）
     pub device_width: u32,    // 设备物理屏幕宽度（用于触控）
     pub device_height: u32,   // 设备物理屏幕高度（用于触控）
+<<<<<<< HEAD
     pub is_landscape: bool,   // 是否为横屏模式（width > height）
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
 }
 
 /// WebSocket 服务器
@@ -31,8 +34,11 @@ pub struct WebSocketServer {
     actual_port: u16,  // 实际使用的端口（可能与请求的端口不同）
     // 使用 broadcast channel 向所有连接的客户端广播视频帧
     tx: broadcast::Sender<Bytes>,
+<<<<<<< HEAD
     // 使用 broadcast channel 向所有连接的客户端广播配置变化
     config_tx: broadcast::Sender<String>,
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     // 缓存 SPS/PPS 配置帧
     video_config: Arc<RwLock<VideoConfig>>,
     // 用于请求IDR帧的通道
@@ -52,7 +58,10 @@ impl WebSocketServer {
         let actual_port = find_available_port(port, 100)?;
 
         let (tx, _rx) = broadcast::channel(2); // 极小缓冲：只保留1-2帧，最小化延迟
+<<<<<<< HEAD
         let (config_tx, _) = broadcast::channel(16); // 配置变化广播通道
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
 
         let video_config = Arc::new(RwLock::new(VideoConfig {
             sps: None,
@@ -61,10 +70,16 @@ impl WebSocketServer {
             height: device_height, // 使用设备分辨率作为初始值
             device_width,   // 设备物理屏幕尺寸
             device_height,  // 设备物理屏幕尺寸
+<<<<<<< HEAD
             is_landscape: device_width > device_height,  // 初始横屏状态
         }));
 
         Ok(Self { port, actual_port, tx, config_tx, video_config, idr_request_tx, control_tx })
+=======
+        }));
+
+        Ok(Self { port, actual_port, tx, video_config, idr_request_tx, control_tx })
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     }
 
     /// 获取实际使用的端口
@@ -77,11 +92,14 @@ impl WebSocketServer {
         self.tx.clone()
     }
 
+<<<<<<< HEAD
     /// 获取配置变化广播器的克隆
     pub fn get_config_sender(&self) -> broadcast::Sender<String> {
         self.config_tx.clone()
     }
 
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     /// 获取视频配置的克隆
     pub fn get_video_config(&self) -> Arc<RwLock<VideoConfig>> {
         self.video_config.clone()
@@ -93,7 +111,10 @@ impl WebSocketServer {
         info!("🌐 Starting WebSocket server on {}", addr);
 
         let tx = self.tx.clone();
+<<<<<<< HEAD
         let config_tx = self.config_tx.clone();
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
         let video_config = self.video_config.clone();
         let idr_request_tx = self.idr_request_tx.clone();
         let control_tx = self.control_tx.clone();
@@ -102,11 +123,18 @@ impl WebSocketServer {
         let app = Router::new()
             .route("/ws", get({
                 let tx = tx.clone();
+<<<<<<< HEAD
                 let config_tx = config_tx.clone();
                 let video_config = video_config.clone();
                 let idr_request_tx = idr_request_tx.clone();
                 let control_tx = control_tx.clone();
                 move |ws| handle_socket(ws, tx, config_tx, video_config, idr_request_tx, control_tx)
+=======
+                let video_config = video_config.clone();
+                let idr_request_tx = idr_request_tx.clone();
+                let control_tx = control_tx.clone();
+                move |ws| handle_socket(ws, tx, video_config, idr_request_tx, control_tx)
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
             }))
             .route("/", get(serve_html));
 
@@ -130,19 +158,29 @@ impl WebSocketServer {
 async fn handle_socket(
     ws: WebSocketUpgrade,
     tx: broadcast::Sender<Bytes>,
+<<<<<<< HEAD
     config_tx: broadcast::Sender<String>,
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     video_config: Arc<RwLock<VideoConfig>>,
     idr_request_tx: mpsc::Sender<()>,
     control_tx: mpsc::Sender<TouchEvent>,
 ) -> impl IntoResponse {
+<<<<<<< HEAD
     ws.on_upgrade(|socket| handle_client(socket, tx, config_tx, video_config, idr_request_tx, control_tx))
+=======
+    ws.on_upgrade(|socket| handle_client(socket, tx, video_config, idr_request_tx, control_tx))
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
 }
 
 /// 处理单个客户端连接
 async fn handle_client(
     mut socket: WebSocket,
     tx: broadcast::Sender<Bytes>,
+<<<<<<< HEAD
     config_tx: broadcast::Sender<String>,
+=======
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     video_config: Arc<RwLock<VideoConfig>>,
     idr_request_tx: mpsc::Sender<()>,
     control_tx: mpsc::Sender<TouchEvent>,
@@ -155,10 +193,17 @@ async fn handle_client(
         warn!("Failed to request IDR frame: {}", e);
     }
 
+<<<<<<< HEAD
     // 立即发送视频配置信息（视频流分辨率 + 设备物理分辨率 + 横屏状态）
     let config = video_config.read().await;
     let config_msg = format!("{{\"type\":\"config\",\"width\":{},\"height\":{},\"device_width\":{},\"device_height\":{},\"is_landscape\":{}}}",
         config.width, config.height, config.device_width, config.device_height, config.is_landscape);
+=======
+    // 立即发送视频配置信息（视频流分辨率 + 设备物理分辨率）
+    let config = video_config.read().await;
+    let config_msg = format!("{{\"type\":\"config\",\"width\":{},\"height\":{},\"device_width\":{},\"device_height\":{}}}",
+        config.width, config.height, config.device_width, config.device_height);
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
     if socket.send(Message::Text(config_msg)).await.is_err() {
         warn!("Failed to send config to client");
         return;
@@ -188,6 +233,7 @@ async fn handle_client(
 
     // 订阅广播频道
     let mut rx = tx.subscribe();
+<<<<<<< HEAD
     let mut config_rx = config_tx.subscribe();
 
     // 持续接收并转发视频帧，同时监听客户端消息和配置变化
@@ -214,6 +260,12 @@ async fn handle_client(
                 }
             }
 
+=======
+
+    // 持续接收并转发视频帧，同时监听客户端消息
+    loop {
+        tokio::select! {
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
             // 接收视频帧并发送
             frame_result = rx.recv() => {
                 match frame_result {
@@ -367,14 +419,20 @@ async fn serve_html() -> impl IntoResponse {
         let videoHeight = 0;
         let deviceWidth = 0;        // 设备物理分辨率（用于触控坐标）
         let deviceHeight = 0;
+<<<<<<< HEAD
         let isLandscape = false;    // 是否为横屏模式
 
         // 调整 canvas 显示尺寸（自动适应横竖屏）
+=======
+
+        // 调整 canvas 显示尺寸
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
         function resizeCanvas() {
             if (videoWidth > 0 && videoHeight > 0) {
                 const videoRatio = videoWidth / videoHeight;
                 const windowWidth = window.innerWidth;
                 const windowHeight = window.innerHeight;
+<<<<<<< HEAD
                 const windowRatio = windowWidth / windowHeight;
 
                 // 根据视频和窗口的宽高比来决定如何适配
@@ -391,6 +449,21 @@ async fn serve_html() -> impl IntoResponse {
                 console.log('🖥️ Canvas resized: video=' + videoWidth + 'x' + videoHeight +
                            ', window=' + windowWidth + 'x' + windowHeight +
                            ', landscape=' + isLandscape);
+=======
+
+                // 计算按高度填满时的宽度
+                const widthByHeight = windowHeight * videoRatio;
+
+                // 如果按高度填满后宽度超出窗口，则按宽度填满
+                if (widthByHeight > windowWidth) {
+                    canvas.style.width = '100vw';
+                    canvas.style.height = `calc(100vw / ${videoRatio})`;
+                } else {
+                    // 否则按高度填满
+                    canvas.style.height = '100vh';
+                    canvas.style.width = `calc(100vh * ${videoRatio})`;
+                }
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
             }
         }
 
@@ -465,12 +538,17 @@ async fn serve_html() -> impl IntoResponse {
                             deviceWidth = msg.device_width;
                             deviceHeight = msg.device_height;
 
+<<<<<<< HEAD
                             // 保存横屏状态
                             isLandscape = msg.is_landscape || false;
 
                             console.log('📐 Video resolution:', videoWidth, 'x', videoHeight);
                             console.log('📱 Device resolution:', deviceWidth, 'x', deviceHeight);
                             console.log('🔄 Landscape mode:', isLandscape);
+=======
+                            console.log('📐 Video resolution:', videoWidth, 'x', videoHeight);
+                            console.log('📱 Device resolution:', deviceWidth, 'x', deviceHeight);
+>>>>>>> fd342a955ca17ac02cb13998ca94fd6c63c9a8a8
 
                             // 设置 canvas 实际分辨率（解码尺寸）
                             canvas.width = msg.width;
