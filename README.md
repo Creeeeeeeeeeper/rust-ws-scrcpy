@@ -4,6 +4,9 @@
 
 🚩其他依赖：**adb**（任意版本），**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对），需要浏览器支持**Webcodecs API**，否则无法在浏览器看到画面🚩*adb和scrcpy-server注意路径，--help中会有提示*
 
+<img width="200" height="300" alt="image" src="https://github.com/user-attachments/assets/4f6ab07c-c84e-43bc-a889-0d07eb22db18" />
+
+
 ## 目录
 
 1. [系统概述](#1-系统概述)
