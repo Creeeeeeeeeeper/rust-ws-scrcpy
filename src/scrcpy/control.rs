@@ -142,6 +142,17 @@ pub struct ClipboardEvent {
     pub paste: bool,  // 是否同时模拟粘贴操作
 }
 
+// 滚动事件（从WebSocket接收）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrollEvent {
+    pub x: f32,           // 归一化坐标 [0, 1]
+    pub y: f32,           // 归一化坐标 [0, 1]
+    pub width: u32,       // 视频宽度
+    pub height: u32,      // 视频高度
+    pub hscroll: i32,     // 水平滚动量
+    pub vscroll: i32,     // 垂直滚动量
+}
+
 // 统一的控制事件类型（从WebSocket接收）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -154,6 +165,8 @@ pub enum ControlEvent {
     Text(TextEvent),
     #[serde(rename = "clipboard")]
     Clipboard(ClipboardEvent),
+    #[serde(rename = "scroll")]
+    Scroll(ScrollEvent),
 }
 
 pub struct ControlChannel {
@@ -295,8 +308,14 @@ impl ControlChannel {
     }
 
     /// 发送滚动事件到设备
-    /// scrcpy 3.x 滚动消息格式：
-    /// [type=3][x][y][width][height][hscroll][vscroll][buttons]
+    /// scrcpy 3.x 滚动消息格式 (21 bytes)：
+    /// [type=3][x:4][y:4][width:2][height:2][hscroll:2][vscroll:2][buttons:4]
+    ///
+    /// 根据官方 scrcpy 抓包分析：
+    /// - 滚动值使用 i16 定点数格式
+    /// - 向下滚动: vscroll = 0xf800 (-2048)
+    /// - 向上滚动: vscroll = 0x0800 (2048)
+    /// - 前端传入 -1/0/1，需要乘以 2048 转换
     pub async fn send_scroll_event(
         &mut self,
         x: f32,
@@ -308,17 +327,17 @@ impl ControlChannel {
     ) -> Result<()> {
         debug!("📜 Sending scroll event: x={}, y={}, h={}, v={}", x, y, hscroll, vscroll);
 
-        let mut msg = Vec::with_capacity(25);
+        let mut msg = Vec::with_capacity(21);
 
         // 1. 消息类型 (1 byte) = InjectScroll (3)
         msg.push(ControlMessageType::InjectScroll as u8);
 
-        // 2. x坐标 (4 bytes, Big Endian)
-        let x_fixed = (x * width as f32) as u32;
+        // 2. x坐标 (4 bytes, Big Endian, i32)
+        let x_fixed = (x * width as f32) as i32;
         msg.extend_from_slice(&x_fixed.to_be_bytes());
 
-        // 3. y坐标 (4 bytes, Big Endian)
-        let y_fixed = (y * height as f32) as u32;
+        // 3. y坐标 (4 bytes, Big Endian, i32)
+        let y_fixed = (y * height as f32) as i32;
         msg.extend_from_slice(&y_fixed.to_be_bytes());
 
         // 4. 屏幕宽度 (2 bytes, Big Endian)
@@ -327,14 +346,21 @@ impl ControlChannel {
         // 5. 屏幕高度 (2 bytes, Big Endian)
         msg.extend_from_slice(&(height as u16).to_be_bytes());
 
-        // 6. 水平滚动 (4 bytes, Big Endian, signed)
-        msg.extend_from_slice(&hscroll.to_be_bytes());
+        // 6. 水平滚动 (2 bytes, Big Endian, i16)
+        // 官方 scrcpy 使用 0x0800 (2048) 作为滚动单位
+        // 前端传入 -1, 0, 1，需要乘以 2048
+        let hscroll_i16 = (hscroll * 2048).clamp(-32768, 32767) as i16;
+        msg.extend_from_slice(&hscroll_i16.to_be_bytes());
 
-        // 7. 垂直滚动 (4 bytes, Big Endian, signed)
-        msg.extend_from_slice(&vscroll.to_be_bytes());
+        // 7. 垂直滚动 (2 bytes, Big Endian, i16)
+        let vscroll_i16 = (vscroll * 2048).clamp(-32768, 32767) as i16;
+        msg.extend_from_slice(&vscroll_i16.to_be_bytes());
 
         // 8. 按钮状态 (4 bytes, Big Endian)
         msg.extend_from_slice(&0u32.to_be_bytes());
+
+        debug!("📤 Scroll message ({} bytes): hscroll_i16={}, vscroll_i16={}, hex={:02x?}",
+            msg.len(), hscroll_i16, vscroll_i16, msg);
 
         self.stream.write_all(&msg).await
             .map_err(|e| ScrcpyError::Network(format!("Failed to send scroll event: {}", e)))?;

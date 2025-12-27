@@ -925,9 +925,49 @@ async fn serve_html() -> impl IntoResponse {
             });
         }
 
+        // ========== 滚轮滚动功能 ==========
+
+        function sendScrollEvent(x, y, hscroll, vscroll) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!videoWidth || !videoHeight) return;
+
+            const event = {
+                type: 'scroll',
+                x: x,
+                y: y,
+                width: videoWidth,
+                height: videoHeight,
+                hscroll: hscroll,
+                vscroll: vscroll
+            };
+            ws.send(JSON.stringify(event));
+        }
+
+        function handleWheel(e) {
+            e.preventDefault();
+
+            const coords = normalizeCoords(e.clientX, e.clientY);
+
+            // 将滚轮 deltaY 转换为滚动量
+            // deltaY > 0 表示向下滚动，对应 vscroll < 0
+            // deltaY < 0 表示向上滚动，对应 vscroll > 0
+            const vscroll = e.deltaY > 0 ? -1 : (e.deltaY < 0 ? 1 : 0);
+            const hscroll = e.deltaX > 0 ? -1 : (e.deltaX < 0 ? 1 : 0);
+
+            if (vscroll !== 0 || hscroll !== 0) {
+                sendScrollEvent(coords.x, coords.y, hscroll, vscroll);
+            }
+        }
+
+        // 设置滚轮事件
+        function setupScrollEvents() {
+            canvas.addEventListener('wheel', handleWheel, { passive: false });
+        }
+
         // 在连接成功后设置触控事件
         setupTouchEvents();
         setupKeyboardEvents();
+        setupScrollEvents();
 
         // 自动连接
         connect();

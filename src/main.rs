@@ -299,6 +299,13 @@ async fn main() -> Result<()> {
                     scrcpy::control::ControlEvent::Clipboard(clip) => {
                         control_channel.set_clipboard(&clip.text, clip.paste).await
                     }
+                    scrcpy::control::ControlEvent::Scroll(scroll) => {
+                        control_channel.send_scroll_event(
+                            scroll.x, scroll.y,
+                            scroll.width, scroll.height,
+                            scroll.hscroll, scroll.vscroll
+                        ).await
+                    }
                 };
                 if let Err(e) = result {
                     error!("Failed to send control event to device: {}", e);
