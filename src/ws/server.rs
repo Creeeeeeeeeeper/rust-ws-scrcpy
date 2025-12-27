@@ -393,12 +393,12 @@ async fn serve_html() -> impl IntoResponse {
             background: rgba(0, 0, 0, 0.85);
         }
 
-        /* 贴边隐藏状态 */
+        /* 贴边隐藏状态 - 露出圆点和部分背景 */
         #decoderStatus.docked-left {
-            transform: translateX(-85%);
+            transform: translateX(calc(-100% + 28px));
         }
         #decoderStatus.docked-right {
-            transform: translateX(85%);
+            transform: translateX(calc(100% - 28px));
         }
         #decoderStatus.docked-left:hover,
         #decoderStatus.docked-right:hover {
@@ -411,6 +411,10 @@ async fn serve_html() -> impl IntoResponse {
             border-radius: 50%;
             background: #4CAF50;
             flex-shrink: 0;
+        }
+
+        #decoderStatus #decoderName {
+            white-space: nowrap;  /* 不换行 */
         }
 
         #decoderStatus.webcodecs .dot { background: #4CAF50; }
@@ -919,11 +923,36 @@ async fn serve_html() -> impl IntoResponse {
             const statusEl = document.getElementById('decoderStatus');
             const nameEl = document.getElementById('decoderName');
 
-            // 保留 docked 类
-            const dockedClass = statusEl.classList.contains('docked-left') ? 'docked-left' :
-                               statusEl.classList.contains('docked-right') ? 'docked-right' : '';
+            // 保留 docked 状态
+            const isDockedLeft = statusEl.classList.contains('docked-left');
+            const isDockedRight = statusEl.classList.contains('docked-right');
+            const dockedClass = isDockedLeft ? 'docked-left' : (isDockedRight ? 'docked-right' : '');
+
             statusEl.className = type + (dockedClass ? ' ' + dockedClass : '');
             nameEl.textContent = name;
+
+            // 保持 flex-direction
+            if (isDockedLeft) {
+                statusEl.style.flexDirection = 'row-reverse';
+            } else if (isDockedRight) {
+                statusEl.style.flexDirection = 'row';
+            }
+
+            // 如果是贴边状态，重新计算位置以确保圆点位置不变
+            if (isDockedLeft || isDockedRight) {
+                // 等待 DOM 更新后重新定位
+                requestAnimationFrame(() => {
+                    const containerRect = getContainerRect();
+                    const pos = getStatusPosition();
+                    const maxX = containerRect.width - pos.width;
+
+                    if (isDockedLeft) {
+                        setStatusPosition(0, pos.y);
+                    } else if (isDockedRight) {
+                        setStatusPosition(maxX, pos.y);
+                    }
+                });
+            }
 
             // 更新选择面板中的激活状态
             document.querySelectorAll('#decoderPanel .option').forEach(option => {
@@ -1066,6 +1095,7 @@ async fn serve_html() -> impl IntoResponse {
 
             // 移除贴边状态以便拖动
             statusEl.classList.remove('docked-left', 'docked-right');
+            statusEl.style.flexDirection = 'row';  // 恢复默认方向
             statusEl.style.transition = 'none';
         }
 
@@ -1125,9 +1155,11 @@ async fn serve_html() -> impl IntoResponse {
             if (pos.x <= EDGE_THRESHOLD) {
                 setStatusPosition(0, pos.y);
                 statusEl.classList.add('docked-left');
+                statusEl.style.flexDirection = 'row-reverse';  // 圆点在右侧露出
             } else if (pos.x >= maxX - EDGE_THRESHOLD) {
                 setStatusPosition(maxX, pos.y);
                 statusEl.classList.add('docked-right');
+                statusEl.style.flexDirection = 'row';  // 圆点在左侧露出
             }
 
             // 如果没有移动，则视为点击，切换面板
@@ -1175,9 +1207,13 @@ async fn serve_html() -> impl IntoResponse {
                     if (data.docked === 'left') {
                         setStatusPosition(0, y);
                         statusEl.classList.add('docked-left');
+                        statusEl.style.flexDirection = 'row-reverse';  // 圆点在右侧露出
                     } else if (data.docked === 'right') {
                         setStatusPosition(maxX, y);
                         statusEl.classList.add('docked-right');
+                        statusEl.style.flexDirection = 'row';  // 圆点在左侧露出
+                    } else {
+                        statusEl.style.flexDirection = 'row';  // 默认方向
                     }
                 }
             } catch (e) {
