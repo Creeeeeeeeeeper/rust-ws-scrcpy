@@ -29,6 +29,7 @@ pub struct VideoConfig {
 pub struct WebSocketServer {
     port: u16,
     actual_port: u16,  // 实际使用的端口（可能与请求的端口不同）
+    public: bool,      // 是否监听所有接口（局域网可访问）
     // 使用 broadcast channel 向所有连接的客户端广播视频帧
     tx: broadcast::Sender<Bytes>,
     // 使用 broadcast channel 向所有连接的客户端广播配置变化
@@ -46,8 +47,8 @@ impl WebSocketServer {
     ///
     /// # Arguments
     /// * `port` - 期望的端口号，如果被占用会自动向后寻找
-    /// * `max_port_attempts` - 端口搜索的最大尝试次数
-    pub fn new(port: u16, idr_request_tx: mpsc::Sender<()>, control_tx: mpsc::Sender<ControlEvent>, device_width: u32, device_height: u32) -> Result<Self> {
+    /// * `public` - 是否监听所有接口（true: 0.0.0.0，false: 127.0.0.1）
+    pub fn new(port: u16, idr_request_tx: mpsc::Sender<()>, control_tx: mpsc::Sender<ControlEvent>, device_width: u32, device_height: u32, public: bool) -> Result<Self> {
         // 自动寻找可用端口
         let actual_port = find_available_port(port, 100)?;
 
@@ -64,7 +65,7 @@ impl WebSocketServer {
             is_landscape: device_width > device_height,  // 初始横屏状态
         }));
 
-        Ok(Self { port, actual_port, tx, config_tx, video_config, idr_request_tx, control_tx })
+        Ok(Self { port, actual_port, public, tx, config_tx, video_config, idr_request_tx, control_tx })
     }
 
     /// 获取实际使用的端口
@@ -89,7 +90,13 @@ impl WebSocketServer {
 
     /// 启动 WebSocket 服务器
     pub async fn start(self) -> Result<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.actual_port));
+        // 根据 public 参数选择监听地址
+        let bind_addr: [u8; 4] = if self.public {
+            [0, 0, 0, 0]      // 监听所有接口，局域网可访问
+        } else {
+            [127, 0, 0, 1]    // 仅本地访问
+        };
+        let addr = SocketAddr::from((bind_addr, self.actual_port));
         info!("🌐 Starting WebSocket server on {}", addr);
 
         let tx = self.tx.clone();
@@ -108,7 +115,9 @@ impl WebSocketServer {
                 let control_tx = control_tx.clone();
                 move |ws| handle_socket(ws, tx, config_tx, video_config, idr_request_tx, control_tx)
             }))
-            .route("/", get(serve_html));
+            .route("/", get(serve_html))
+            .route("/decoder/Decoder.min.js", get(serve_broadway_decoder))
+            .route("/decoder/jmuxer.min.js", get(serve_jmuxer));
 
         // 启动服务器
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -310,6 +319,10 @@ async fn serve_html() -> impl IntoResponse {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Rust-Scrcpy Web Viewer</title>
+    <!-- Broadway.js H.264 解码器 (本地文件) -->
+    <script src="/decoder/Decoder.min.js"></script>
+    <!-- JMuxer MSE 播放器 (本地文件) -->
+    <script src="/decoder/jmuxer.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -338,6 +351,137 @@ async fn serve_html() -> impl IntoResponse {
         #videoCanvas {
             display: block;
             background: #000;
+            position: relative;
+        }
+
+        /* Canvas 容器，用于裁剪超出部分 */
+        #canvasContainer {
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* 解码器状态指示器 */
+        #decoderStatus {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: transform 0.3s ease, opacity 0.3s ease;
+            cursor: grab;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        #decoderStatus:active {
+            cursor: grabbing;
+        }
+
+        #decoderStatus:hover {
+            background: rgba(0, 0, 0, 0.85);
+        }
+
+        /* 贴边隐藏状态 */
+        #decoderStatus.docked-left {
+            transform: translateX(-85%);
+        }
+        #decoderStatus.docked-right {
+            transform: translateX(85%);
+        }
+        #decoderStatus.docked-left:hover,
+        #decoderStatus.docked-right:hover {
+            transform: translateX(0);
+        }
+
+        #decoderStatus .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4CAF50;
+            flex-shrink: 0;
+        }
+
+        #decoderStatus.webcodecs .dot { background: #4CAF50; }
+        #decoderStatus.broadway .dot { background: #2196F3; }
+        #decoderStatus.jmuxer .dot { background: #FF9800; }
+        #decoderStatus.error .dot { background: #F44336; }
+        #decoderStatus.loading .dot {
+            background: #FFC107;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* 解码器选择面板 */
+        #decoderPanel {
+            position: fixed;
+            padding: 12px;
+            border-radius: 12px;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(10px);
+            z-index: 1001;
+            display: none;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 200px;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        #decoderPanel.visible {
+            display: flex;
+        }
+
+        #decoderPanel .option {
+            padding: 10px 14px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.2s;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        #decoderPanel .option:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        #decoderPanel .option.active {
+            background: rgba(76, 175, 80, 0.3);
+            border: 1px solid #4CAF50;
+        }
+
+        #decoderPanel .option.unavailable {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        #decoderPanel .option .name {
+            font-weight: 500;
+        }
+
+        #decoderPanel .option .status {
+            font-size: 11px;
+            opacity: 0.7;
         }
 
         .controls {
@@ -349,25 +493,719 @@ async fn serve_html() -> impl IntoResponse {
     </style>
 </head>
 <body>
-
+    <!-- Canvas 容器，用于裁剪超出部分 -->
+    <div id="canvasContainer">
         <canvas id="videoCanvas" width="1920" height="1080"></canvas>
 
+        <!-- 解码器状态指示器 -->
+        <div id="decoderStatus" class="loading">
+            <span class="dot"></span>
+            <span id="decoderName">初始化中...</span>
+        </div>
+    </div>
+
+    <!-- 解码器选择面板 -->
+    <div id="decoderPanel">
+        <div class="option" data-decoder="webcodecs">
+            <span class="name">WebCodecs</span>
+            <span class="status" id="webcodecs-status">检测中...</span>
+        </div>
+        <div class="option" data-decoder="broadway">
+            <span class="name">Broadway</span>
+            <span class="status" id="broadway-status">检测中...</span>
+        </div>
+        <div class="option" data-decoder="jmuxer">
+            <span class="name">JMuxer (MSE)</span>
+            <span class="status" id="jmuxer-status">检测中...</span>
+        </div>
+    </div>
+
     <script>
+        // ========== 全局变量 ==========
         let ws = null;
-        let decoder = null;
+        let currentDecoder = null;
         let canvas = document.getElementById('videoCanvas');
         let ctx = canvas.getContext('2d');
-        let decoderReady = false;
         let frameCount = 0;
         let cachedSPS = null;
         let cachedPPS = null;
-        let videoWidth = 0;         // 视频流分辨率（用于canvas显示）
+        let videoWidth = 0;
         let videoHeight = 0;
-        let deviceWidth = 0;        // 设备物理分辨率（用于触控坐标）
+        let deviceWidth = 0;
         let deviceHeight = 0;
-        let isLandscape = false;    // 是否为横屏模式
+        let isLandscape = false;
 
-        // 调整 canvas 显示尺寸（自动适应横竖屏）
+        // 解码器可用性状态
+        const decoderSupport = {
+            webcodecs: false,
+            broadway: false,
+            jmuxer: false
+        };
+
+        // 当前使用的解码器类型
+        let currentDecoderType = null;
+
+        // ========== 解码器抽象接口 ==========
+        class BaseDecoder {
+            constructor(canvas) {
+                this.canvas = canvas;
+                this.ctx = canvas.getContext('2d');
+                this.ready = false;
+                this.frameCount = 0;
+            }
+
+            async init(width, height) {
+                throw new Error('Not implemented');
+            }
+
+            decode(nalData, isKeyFrame) {
+                throw new Error('Not implemented');
+            }
+
+            close() {
+                this.ready = false;
+            }
+
+            static isSupported() {
+                return false;
+            }
+
+            getName() {
+                return 'Base';
+            }
+        }
+
+        // ========== WebCodecs 解码器 ==========
+        class WebCodecsDecoder extends BaseDecoder {
+            constructor(canvas) {
+                super(canvas);
+                this.decoder = null;
+            }
+
+            static isSupported() {
+                return 'VideoDecoder' in window;
+            }
+
+            getName() {
+                return 'WebCodecs';
+            }
+
+            async init(width, height) {
+                if (!WebCodecsDecoder.isSupported()) {
+                    throw new Error('WebCodecs API not supported');
+                }
+
+                if (this.decoder) {
+                    this.decoder.close();
+                }
+
+                this.decoder = new VideoDecoder({
+                    output: (frame) => {
+                        this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+                        frame.close();
+                        this.frameCount++;
+                    },
+                    error: (e) => {
+                        console.error('WebCodecs decoder error:', e);
+                        this.ready = false;
+                    }
+                });
+
+                this.decoder.configure({
+                    codec: 'avc1.42001E',
+                    optimizeForLatency: true,
+                    hardwareAcceleration: 'prefer-hardware',
+                });
+
+                this.ready = true;
+                console.log('✅ WebCodecs decoder initialized');
+            }
+
+            decode(nalData, isKeyFrame) {
+                if (!this.decoder || !this.ready) return;
+
+                try {
+                    if (isKeyFrame && this.decoder.decodeQueueSize > 0) {
+                        this.decoder.flush();
+                    }
+
+                    if (!isKeyFrame && this.decoder.decodeQueueSize > 3) {
+                        console.warn('WebCodecs queue full, dropping P-frame');
+                        return;
+                    }
+
+                    const chunk = new EncodedVideoChunk({
+                        type: isKeyFrame ? 'key' : 'delta',
+                        timestamp: performance.now() * 1000,
+                        data: nalData
+                    });
+                    this.decoder.decode(chunk);
+                } catch (e) {
+                    console.error('WebCodecs decode error:', e);
+                }
+            }
+
+            close() {
+                if (this.decoder) {
+                    this.decoder.close();
+                    this.decoder = null;
+                }
+                super.close();
+            }
+        }
+
+        // ========== Broadway.js 原生解码器 ==========
+        class BroadwayDecoder extends BaseDecoder {
+            constructor(canvas) {
+                super(canvas);
+                this.decoder = null;
+                this.imageData = null;
+            }
+
+            static isSupported() {
+                // Broadway Decoder.min.js 提供 Decoder 类
+                return typeof Decoder !== 'undefined';
+            }
+
+            getName() {
+                return 'Broadway';
+            }
+
+            async init(width, height) {
+                try {
+                    if (this.decoder) {
+                        this.decoder = null;
+                    }
+
+                    const w = width || this.canvas.width;
+                    const h = height || this.canvas.height;
+
+                    // 创建 Broadway 解码器实例
+                    // 使用 rgb: true 返回 RGBA 数据便于直接绘制到 canvas
+                    this.decoder = new Decoder({
+                        rgb: true
+                    });
+
+                    // 设置解码回调
+                    this.decoder.onPictureDecoded = (buffer, decWidth, decHeight) => {
+                        // buffer 是 Uint8Array，包含 RGBA 数据
+                        this.renderRGB(buffer, decWidth, decHeight);
+                        this.frameCount++;
+                    };
+
+                    this.ready = true;
+                    console.log('✅ Broadway decoder initialized');
+                } catch (e) {
+                    console.error('Broadway init error:', e);
+                    throw e;
+                }
+            }
+
+            renderRGB(buffer, width, height) {
+                // 确保 canvas 尺寸匹配
+                if (this.canvas.width !== width || this.canvas.height !== height) {
+                    // 不改变 canvas 尺寸，使用缩放绘制
+                }
+
+                // 创建或重用 ImageData
+                if (!this.imageData || this.imageData.width !== width || this.imageData.height !== height) {
+                    this.imageData = this.ctx.createImageData(width, height);
+                }
+
+                // 复制 RGBA 数据
+                this.imageData.data.set(buffer);
+
+                // 绘制到 canvas（如果尺寸不同，需要缩放）
+                if (this.canvas.width === width && this.canvas.height === height) {
+                    this.ctx.putImageData(this.imageData, 0, 0);
+                } else {
+                    // 创建临时 canvas 进行缩放
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = width;
+                    tempCanvas.height = height;
+                    const tempCtx = tempCanvas.getContext('2d');
+                    tempCtx.putImageData(this.imageData, 0, 0);
+                    this.ctx.drawImage(tempCanvas, 0, 0, this.canvas.width, this.canvas.height);
+                }
+            }
+
+            decode(nalData, isKeyFrame) {
+                if (!this.decoder || !this.ready) return;
+
+                try {
+                    this.decoder.decode(nalData);
+                } catch (e) {
+                    console.error('Broadway decode error:', e);
+                }
+            }
+
+            close() {
+                this.decoder = null;
+                this.imageData = null;
+                super.close();
+            }
+        }
+
+        // ========== JMuxer MSE 解码器 ==========
+        class JMuxerDecoder extends BaseDecoder {
+            constructor(canvas) {
+                super(canvas);
+                this.player = null;
+                this.video = null;
+            }
+
+            static isSupported() {
+                // JMuxer 需要 MSE 支持
+                return typeof JMuxer !== 'undefined' &&
+                       typeof MediaSource !== 'undefined' &&
+                       MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
+            }
+
+            getName() {
+                return 'JMuxer (MSE)';
+            }
+
+            async init(width, height) {
+                try {
+                    if (this.player) {
+                        this.player.destroy();
+                    }
+                    if (this.video) {
+                        this.video.remove();
+                    }
+
+                    // 创建隐藏的 video 元素
+                    const video = document.createElement('video');
+                    video.style.cssText = 'position:absolute;top:-9999px;left:-9999px;';
+                    video.muted = true;
+                    video.autoplay = true;
+                    video.playsInline = true;
+                    document.body.appendChild(video);
+
+                    this.player = new JMuxer({
+                        node: video,
+                        mode: 'video',
+                        flushingTime: 1,  // 减少延迟
+                        clearBuffer: true,
+                        fps: 60,
+                        debug: false,
+                        onReady: () => {
+                            console.log('✅ JMuxer ready');
+                            video.play().catch(e => console.warn('Video play failed:', e));
+                        },
+                        onError: (e) => {
+                            console.error('JMuxer error:', e);
+                        }
+                    });
+
+                    this.video = video;
+
+                    // 将视频帧绘制到 canvas
+                    this.renderLoop();
+
+                    this.ready = true;
+                    console.log('✅ JMuxer decoder initialized');
+                } catch (e) {
+                    console.error('JMuxer init error:', e);
+                    throw e;
+                }
+            }
+
+            renderLoop() {
+                const render = () => {
+                    if (this.video && this.video.readyState >= 2) {
+                        this.ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
+                        this.frameCount++;
+                    }
+                    if (this.ready) {
+                        requestAnimationFrame(render);
+                    }
+                };
+                requestAnimationFrame(render);
+            }
+
+            decode(nalData, isKeyFrame) {
+                if (!this.player || !this.ready) return;
+
+                try {
+                    // JMuxer 需要特定的数据格式
+                    this.player.feed({
+                        video: nalData,
+                        duration: 1000 / 60  // 假设 60fps
+                    });
+                } catch (e) {
+                    console.error('JMuxer decode error:', e);
+                }
+            }
+
+            close() {
+                if (this.player) {
+                    this.player.destroy();
+                    this.player = null;
+                }
+                if (this.video) {
+                    this.video.remove();
+                    this.video = null;
+                }
+                super.close();
+            }
+        }
+
+        // ========== 解码器管理器 ==========
+        const DecoderManager = {
+            decoders: {
+                webcodecs: WebCodecsDecoder,
+                broadway: BroadwayDecoder,
+                jmuxer: JMuxerDecoder
+            },
+
+            // 检测所有解码器的可用性
+            async detectSupport() {
+                decoderSupport.webcodecs = WebCodecsDecoder.isSupported();
+                decoderSupport.broadway = BroadwayDecoder.isSupported();
+                decoderSupport.jmuxer = JMuxerDecoder.isSupported();
+
+                // 更新 UI
+                this.updateSupportUI();
+
+                console.log('🔍 Decoder support:', decoderSupport);
+                return decoderSupport;
+            },
+
+            updateSupportUI() {
+                document.getElementById('webcodecs-status').textContent =
+                    decoderSupport.webcodecs ? '✓ 可用 (硬件加速)' : '✗ 不支持';
+                document.getElementById('broadway-status').textContent =
+                    decoderSupport.broadway ? '✓ 可用 (软解码)' : '✗ 未加载';
+                document.getElementById('jmuxer-status').textContent =
+                    decoderSupport.jmuxer ? '✓ 可用 (MSE)' : '✗ 不支持';
+
+                // 标记不可用的选项
+                document.querySelectorAll('#decoderPanel .option').forEach(option => {
+                    const decoder = option.dataset.decoder;
+                    if (!decoderSupport[decoder]) {
+                        option.classList.add('unavailable');
+                    } else {
+                        option.classList.remove('unavailable');
+                    }
+                });
+            },
+
+            // 获取最佳可用解码器
+            getBestDecoder() {
+                if (decoderSupport.webcodecs) return 'webcodecs';
+                if (decoderSupport.jmuxer) return 'jmuxer';
+                if (decoderSupport.broadway) return 'broadway';
+                return null;
+            },
+
+            // 创建解码器实例
+            async createDecoder(type, canvas) {
+                const DecoderClass = this.decoders[type];
+                if (!DecoderClass) {
+                    throw new Error(`Unknown decoder type: ${type}`);
+                }
+
+                if (!decoderSupport[type]) {
+                    throw new Error(`Decoder ${type} is not supported`);
+                }
+
+                return new DecoderClass(canvas);
+            }
+        };
+
+        // ========== UI 控制函数 ==========
+        function updateDecoderStatus(type, name) {
+            const statusEl = document.getElementById('decoderStatus');
+            const nameEl = document.getElementById('decoderName');
+
+            // 保留 docked 类
+            const dockedClass = statusEl.classList.contains('docked-left') ? 'docked-left' :
+                               statusEl.classList.contains('docked-right') ? 'docked-right' : '';
+            statusEl.className = type + (dockedClass ? ' ' + dockedClass : '');
+            nameEl.textContent = name;
+
+            // 更新选择面板中的激活状态
+            document.querySelectorAll('#decoderPanel .option').forEach(option => {
+                option.classList.remove('active');
+                if (option.dataset.decoder === type) {
+                    option.classList.add('active');
+                }
+            });
+        }
+
+        function toggleDecoderPanel() {
+            const panel = document.getElementById('decoderPanel');
+            const status = document.getElementById('decoderStatus');
+            panel.classList.toggle('visible');
+
+            // 定位面板到状态指示器下方
+            if (panel.classList.contains('visible')) {
+                const rect = status.getBoundingClientRect();
+                const panelWidth = 200;
+
+                // 计算面板位置
+                let left = rect.left;
+                let top = rect.bottom + 8;
+
+                // 确保不超出右边界
+                if (left + panelWidth > window.innerWidth) {
+                    left = window.innerWidth - panelWidth - 10;
+                }
+                // 确保不超出左边界
+                if (left < 10) {
+                    left = 10;
+                }
+
+                panel.style.left = left + 'px';
+                panel.style.top = top + 'px';
+                panel.style.right = 'auto';
+            }
+        }
+
+        async function switchDecoder(type) {
+            if (!decoderSupport[type]) {
+                console.warn(`Decoder ${type} is not supported`);
+                return;
+            }
+
+            if (currentDecoderType === type) {
+                toggleDecoderPanel();
+                return;
+            }
+
+            console.log(`🔄 Switching to ${type} decoder...`);
+            updateDecoderStatus('loading', `切换到 ${type}...`);
+
+            try {
+                // 关闭当前解码器
+                if (currentDecoder) {
+                    currentDecoder.close();
+                }
+
+                // 创建新解码器
+                currentDecoder = await DecoderManager.createDecoder(type, canvas);
+                await currentDecoder.init(videoWidth, videoHeight);
+
+                currentDecoderType = type;
+                frameCount = 0;
+
+                updateDecoderStatus(type, currentDecoder.getName());
+                console.log(`✅ Switched to ${type} decoder`);
+
+                // 保存用户选择到 URL
+                const url = new URL(window.location);
+                url.searchParams.set('decoder', type);
+                window.history.replaceState({}, '', url);
+
+            } catch (e) {
+                console.error(`Failed to switch to ${type}:`, e);
+                updateDecoderStatus('error', `${type} 初始化失败`);
+
+                // 尝试回退到其他解码器
+                const fallback = DecoderManager.getBestDecoder();
+                if (fallback && fallback !== type) {
+                    console.log(`🔄 Falling back to ${fallback}...`);
+                    await switchDecoder(fallback);
+                }
+            }
+
+            toggleDecoderPanel();
+        }
+
+        // ========== 拖动、吸附、贴边隐藏 ==========
+        const statusEl = document.getElementById('decoderStatus');
+        const container = document.getElementById('canvasContainer');
+        let isDragging = false;
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let elementStartX = 0;
+        let elementStartY = 0;
+        let hasMoved = false;
+        const SNAP_THRESHOLD = 20;  // 吸附阈值
+        const EDGE_THRESHOLD = 30;  // 贴边隐藏阈值
+
+        function getContainerRect() {
+            return container.getBoundingClientRect();
+        }
+
+        function getStatusPosition() {
+            const rect = statusEl.getBoundingClientRect();
+            const containerRect = getContainerRect();
+            return {
+                x: rect.left - containerRect.left,
+                y: rect.top - containerRect.top,
+                width: rect.width,
+                height: rect.height
+            };
+        }
+
+        function setStatusPosition(x, y) {
+            statusEl.style.left = x + 'px';
+            statusEl.style.top = y + 'px';
+            statusEl.style.right = 'auto';
+        }
+
+        function handleDragStart(e) {
+            if (e.target.closest('#decoderPanel')) return;
+
+            isDragging = true;
+            hasMoved = false;
+
+            const pos = getStatusPosition();
+            elementStartX = pos.x;
+            elementStartY = pos.y;
+
+            if (e.type === 'touchstart') {
+                dragStartX = e.touches[0].clientX;
+                dragStartY = e.touches[0].clientY;
+            } else {
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+            }
+
+            // 移除贴边状态以便拖动
+            statusEl.classList.remove('docked-left', 'docked-right');
+            statusEl.style.transition = 'none';
+        }
+
+        function handleDragMove(e) {
+            if (!isDragging) return;
+
+            let clientX, clientY;
+            if (e.type === 'touchmove') {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+                e.preventDefault();
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+
+            const deltaX = clientX - dragStartX;
+            const deltaY = clientY - dragStartY;
+
+            // 判断是否真的在移动
+            if (Math.abs(deltaX) > 5 || Math.abs(deltaY) > 5) {
+                hasMoved = true;
+            }
+
+            let newX = elementStartX + deltaX;
+            let newY = elementStartY + deltaY;
+
+            const pos = getStatusPosition();
+            const containerRect = getContainerRect();
+            const maxX = containerRect.width - pos.width;
+            const maxY = containerRect.height - pos.height;
+
+            // 边界限制（限制在容器内）
+            newX = Math.max(0, Math.min(newX, maxX));
+            newY = Math.max(0, Math.min(newY, maxY));
+
+            // 边缘吸附
+            if (newX < SNAP_THRESHOLD) newX = 0;
+            if (newX > maxX - SNAP_THRESHOLD) newX = maxX;
+            if (newY < SNAP_THRESHOLD) newY = 0;
+            if (newY > maxY - SNAP_THRESHOLD) newY = maxY;
+
+            setStatusPosition(newX, newY);
+        }
+
+        function handleDragEnd(e) {
+            if (!isDragging) return;
+            isDragging = false;
+
+            statusEl.style.transition = 'transform 0.3s ease, opacity 0.3s ease';
+
+            const pos = getStatusPosition();
+            const containerRect = getContainerRect();
+            const maxX = containerRect.width - pos.width;
+
+            // 贴边隐藏判断
+            if (pos.x <= EDGE_THRESHOLD) {
+                setStatusPosition(0, pos.y);
+                statusEl.classList.add('docked-left');
+            } else if (pos.x >= maxX - EDGE_THRESHOLD) {
+                setStatusPosition(maxX, pos.y);
+                statusEl.classList.add('docked-right');
+            }
+
+            // 如果没有移动，则视为点击，切换面板
+            if (!hasMoved) {
+                toggleDecoderPanel();
+            }
+
+            // 保存位置到 localStorage
+            saveStatusPosition();
+        }
+
+        function saveStatusPosition() {
+            const pos = getStatusPosition();
+            const containerRect = getContainerRect();
+            // 保存相对位置（百分比）
+            const relX = pos.x / containerRect.width;
+            const relY = pos.y / containerRect.height;
+            const docked = statusEl.classList.contains('docked-left') ? 'left' :
+                          statusEl.classList.contains('docked-right') ? 'right' : '';
+            localStorage.setItem('decoderStatusPos', JSON.stringify({
+                relX: relX, relY: relY, docked: docked
+            }));
+        }
+
+        function loadStatusPosition() {
+            try {
+                const saved = localStorage.getItem('decoderStatusPos');
+                if (saved) {
+                    const data = JSON.parse(saved);
+                    const containerRect = getContainerRect();
+                    const pos = getStatusPosition();
+
+                    // 从相对位置恢复
+                    let x = data.relX * containerRect.width;
+                    let y = data.relY * containerRect.height;
+
+                    // 确保不超出边界
+                    const maxX = containerRect.width - pos.width;
+                    const maxY = containerRect.height - pos.height;
+                    x = Math.max(0, Math.min(x, maxX));
+                    y = Math.max(0, Math.min(y, maxY));
+
+                    setStatusPosition(x, y);
+
+                    if (data.docked === 'left') {
+                        setStatusPosition(0, y);
+                        statusEl.classList.add('docked-left');
+                    } else if (data.docked === 'right') {
+                        setStatusPosition(maxX, y);
+                        statusEl.classList.add('docked-right');
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to load status position:', e);
+            }
+        }
+
+        // 绑定拖动事件
+        statusEl.addEventListener('mousedown', handleDragStart);
+        document.addEventListener('mousemove', handleDragMove);
+        document.addEventListener('mouseup', handleDragEnd);
+
+        statusEl.addEventListener('touchstart', handleDragStart, { passive: false });
+        document.addEventListener('touchmove', handleDragMove, { passive: false });
+        document.addEventListener('touchend', handleDragEnd);
+
+        // 绑定解码器选项点击事件
+        document.querySelectorAll('#decoderPanel .option').forEach(option => {
+            option.addEventListener('click', () => {
+                const decoder = option.dataset.decoder;
+                if (decoder) switchDecoder(decoder);
+            });
+        });
+
+        // 加载保存的位置
+        loadStatusPosition();
+
+        // ========== Canvas 尺寸管理 ==========
         function resizeCanvas() {
             if (videoWidth > 0 && videoHeight > 0) {
                 const videoRatio = videoWidth / videoHeight;
@@ -375,68 +1213,87 @@ async fn serve_html() -> impl IntoResponse {
                 const windowHeight = window.innerHeight;
                 const windowRatio = windowWidth / windowHeight;
 
-                // 根据视频和窗口的宽高比来决定如何适配
+                let canvasStyleWidth, canvasStyleHeight;
                 if (videoRatio > windowRatio) {
-                    // 视频更宽（横屏视频在窄窗口），按宽度填满
-                    canvas.style.width = '100vw';
-                    canvas.style.height = `${windowWidth / videoRatio}px`;
+                    canvasStyleWidth = windowWidth;
+                    canvasStyleHeight = windowWidth / videoRatio;
                 } else {
-                    // 视频更高（竖屏视频），按高度填满
-                    canvas.style.height = '100vh';
-                    canvas.style.width = `${windowHeight * videoRatio}px`;
+                    canvasStyleHeight = windowHeight;
+                    canvasStyleWidth = windowHeight * videoRatio;
                 }
 
-                console.log('🖥️ Canvas resized: video=' + videoWidth + 'x' + videoHeight +
-                           ', window=' + windowWidth + 'x' + windowHeight +
-                           ', landscape=' + isLandscape);
+                canvas.style.width = canvasStyleWidth + 'px';
+                canvas.style.height = canvasStyleHeight + 'px';
+
+                // 同步设置容器尺寸
+                container.style.width = canvasStyleWidth + 'px';
+                container.style.height = canvasStyleHeight + 'px';
+
+                // 重新加载位置以适应新尺寸
+                loadStatusPosition();
             }
         }
 
-        // 监听窗口大小变化
         window.addEventListener('resize', resizeCanvas);
 
-        // 简单的 H.264 解码（需要浏览器支持 WebCodecs API）
-        async function initDecoder() {
-            if (!('VideoDecoder' in window)) {
-                console.error('WebCodecs API not supported');
-                // updateStatus('error', 'Browser does not support WebCodecs API');
+        // 点击其他区域关闭面板
+        document.addEventListener('click', (e) => {
+            const panel = document.getElementById('decoderPanel');
+            const status = document.getElementById('decoderStatus');
+            if (!panel.contains(e.target) && !status.contains(e.target)) {
+                panel.classList.remove('visible');
+            }
+        });
+
+        // ========== 解码处理 ==========
+        function handleVideoFrame(data) {
+            if (!currentDecoder || !currentDecoder.ready) return;
+
+            // 检查 NAL 单元类型
+            let nalType = 0;
+            if (data.length > 4) {
+                nalType = data[4] & 0x1F;
+            }
+
+            // 缓存 SPS/PPS
+            if (nalType === 7) {
+                cachedSPS = data;
+                return;
+            } else if (nalType === 8) {
+                cachedPPS = data;
                 return;
             }
 
-            decoder = new VideoDecoder({
-                output: (frame) => {
-                    // 绘制帧到 canvas（保持 canvas 的实际分辨率和 CSS 显示尺寸）
-                    // 不要在这里修改 canvas.width/height，因为已经在 config 消息中设置好了
-                    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-                    frame.close();
+            // IDR 帧处理
+            if (nalType === 5) {
+                let combinedData = data;
 
-                    frameCount++;
-                    if (frameCount === 1) {
-                        // updateStatus('connected', 'Video streaming! ' + canvas.width + 'x' + canvas.height);
-                    }
-                },
-                error: (e) => {
-                    console.error('Decoder error:', e);
-                    decoderReady = false;
+                if (cachedSPS && cachedPPS) {
+                    const totalLength = cachedSPS.length + cachedPPS.length + data.length;
+                    combinedData = new Uint8Array(totalLength);
+
+                    let offset = 0;
+                    combinedData.set(cachedSPS, offset);
+                    offset += cachedSPS.length;
+                    combinedData.set(cachedPPS, offset);
+                    offset += cachedPPS.length;
+                    combinedData.set(data, offset);
                 }
-            });
 
-            // 简单配置解码器 - 不使用 description，让解码器从帧中自动提取
-            try {
-                decoder.configure({
-                    codec: 'avc1.42001E', // H.264 Baseline Profile Level 3.0
-                    optimizeForLatency: true,
-                    hardwareAcceleration: 'prefer-hardware',
-                });
-                decoderReady = true;
-            } catch (e) {
-                console.error('Failed to configure decoder:', e);
-                // updateStatus('error', 'Failed to configure decoder');
+                currentDecoder.decode(combinedData, true);
+                frameCount++;
+                return;
+            }
+
+            // P 帧处理
+            if (frameCount > 0) {
+                currentDecoder.decode(data, false);
             }
         }
 
-        function connect() {
-            // updateStatus('connecting', 'Connecting to server...');
+        // ========== WebSocket 连接 ==========
+        async function connect() {
+            updateDecoderStatus('loading', '连接中...');
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -444,9 +1301,43 @@ async fn serve_html() -> impl IntoResponse {
             ws = new WebSocket(wsUrl);
             ws.binaryType = 'arraybuffer';
 
-            ws.onopen = () => {
-                // updateStatus('connected', 'Connected! Receiving video stream...');
-                initDecoder();
+            ws.onopen = async () => {
+                console.log('✅ WebSocket connected');
+
+                // 检测解码器支持
+                await DecoderManager.detectSupport();
+
+                // 从 URL 参数获取指定的解码器
+                const urlParams = new URLSearchParams(window.location.search);
+                const requestedDecoder = urlParams.get('decoder');
+
+                // 选择解码器
+                let decoderToUse = null;
+
+                if (requestedDecoder && decoderSupport[requestedDecoder]) {
+                    decoderToUse = requestedDecoder;
+                    console.log(`📋 Using requested decoder: ${requestedDecoder}`);
+                } else {
+                    decoderToUse = DecoderManager.getBestDecoder();
+                    console.log(`🔍 Auto-selected decoder: ${decoderToUse}`);
+                }
+
+                if (!decoderToUse) {
+                    updateDecoderStatus('error', '无可用解码器');
+                    console.error('No decoder available!');
+                    return;
+                }
+
+                // 初始化解码器
+                try {
+                    currentDecoder = await DecoderManager.createDecoder(decoderToUse, canvas);
+                    await currentDecoder.init(videoWidth || 1920, videoHeight || 1080);
+                    currentDecoderType = decoderToUse;
+                    updateDecoderStatus(decoderToUse, currentDecoder.getName());
+                } catch (e) {
+                    console.error('Decoder init failed:', e);
+                    updateDecoderStatus('error', '解码器初始化失败');
+                }
             };
 
             ws.onmessage = (event) => {
@@ -455,33 +1346,23 @@ async fn serve_html() -> impl IntoResponse {
                     try {
                         const msg = JSON.parse(event.data);
                         if (msg.type === 'config') {
-                            // 保存视频流分辨率（用于canvas显示）
                             videoWidth = msg.width;
                             videoHeight = msg.height;
-
-                            // 保存设备物理分辨率（用于触控坐标）
                             deviceWidth = msg.device_width;
                             deviceHeight = msg.device_height;
-
-                            // 保存横屏状态
                             isLandscape = msg.is_landscape || false;
 
                             console.log('📐 Video resolution:', videoWidth, 'x', videoHeight);
                             console.log('📱 Device resolution:', deviceWidth, 'x', deviceHeight);
-                            console.log('🔄 Landscape mode:', isLandscape);
 
-                            // 设置 canvas 实际分辨率（解码尺寸）
                             canvas.width = msg.width;
                             canvas.height = msg.height;
-
-                            // 调整显示尺寸
                             resizeCanvas();
 
-                            // 重新配置解码器
-                            if (decoder) {
-                                decoder.close();
+                            // 重新初始化解码器
+                            if (currentDecoder) {
+                                currentDecoder.init(videoWidth, videoHeight);
                             }
-                            initDecoder();
                         }
                     } catch (e) {
                         console.error('Failed to parse config:', e);
@@ -491,109 +1372,27 @@ async fn serve_html() -> impl IntoResponse {
 
                 // 处理二进制消息（视频帧）
                 if (event.data instanceof ArrayBuffer) {
-                    const data = new Uint8Array(event.data);
-
-                    // 检查 NAL 单元类型
-                    let nalType = 0;
-                    if (data.length > 4) {
-                        // 跳过起始码 00 00 00 01
-                        nalType = data[4] & 0x1F;
-                    }
-
-                    // 缓存 SPS/PPS，等待 IDR 帧
-                    if (nalType === 7) {
-                        cachedSPS = data;
-                        return; // 不立即解码，等待 IDR
-                    } else if (nalType === 8) {
-                        cachedPPS = data;
-                        return; // 不立即解码，等待 IDR
-                    }
-
-                    // 收到 IDR 帧时，合并 SPS + PPS + IDR 为一个完整的帧
-                    if (nalType === 5) {
-                        if (decoder && decoderReady) {
-                            try {
-                                // ===== IDR 关键帧优先：如果队列积压，先清空队列
-                                if (decoder.decodeQueueSize > 0) {
-                                    console.warn('Flushing ' + decoder.decodeQueueSize + ' queued frames before IDR');
-                                    decoder.flush();
-                                }
-
-                                // 合并 SPS + PPS + IDR 成一个完整的 Annex-B 流
-                                let combinedData;
-
-                                if (cachedSPS && cachedPPS) {
-                                    // 计算总长度
-                                    const totalLength = cachedSPS.length + cachedPPS.length + data.length;
-                                    combinedData = new Uint8Array(totalLength);
-
-                                    // 拼接：SPS + PPS + IDR（每个都有自己的起始码）
-                                    let offset = 0;
-                                    combinedData.set(cachedSPS, offset);
-                                    offset += cachedSPS.length;
-                                    combinedData.set(cachedPPS, offset);
-                                    offset += cachedPPS.length;
-                                    combinedData.set(data, offset);
-                                } else {
-                                    // 如果没有缓存的 SPS/PPS，只发送 IDR
-                                    combinedData = data;
-                                }
-
-                                // 发送合并后的完整关键帧
-                                const keyChunk = new EncodedVideoChunk({
-                                    type: 'key',
-                                    timestamp: performance.now() * 1000,
-                                    data: combinedData
-                                });
-                                decoder.decode(keyChunk);
-
-                            } catch (e) {
-                                console.error('Decode error:', e.message);
-                            }
-                        }
-                        return;
-                    }
-
-                    // 其他帧（非 IDR）正常解码
-                    if (decoder && decoderReady && frameCount > 0) {
-                        try {
-                            // ===== 限制解码器队列大小，防止积压延迟
-                            // 如果队列 > 3 帧，且当前是 P-frame，则丢弃
-                            if (decoder.decodeQueueSize > 3) {
-                                console.warn('Decoder queue full (' + decoder.decodeQueueSize + '), dropping P-frame');
-                                return;
-                            }
-
-                            const chunk = new EncodedVideoChunk({
-                                type: 'delta',
-                                timestamp: performance.now() * 1000,
-                                data: data
-                            });
-                            decoder.decode(chunk);
-                        } catch (e) {
-                            console.error('Decode error:', e.message);
-                        }
-                    }
+                    handleVideoFrame(new Uint8Array(event.data));
                 }
             };
 
             ws.onerror = (error) => {
-                // updateStatus('error', 'Connection error');
                 console.error('WebSocket error:', error);
-                clearCanvas();  // 连接错误时清空画布
+                updateDecoderStatus('error', '连接错误');
+                clearCanvas();
             };
 
             ws.onclose = () => {
-                // updateStatus('error', 'Disconnected from server');
-                clearCanvas();  // 连接断开时清空画布
-                if (decoder) {
-                    decoder.close();
-                    decoder = null;
+                console.log('WebSocket closed');
+                updateDecoderStatus('error', '连接断开');
+                clearCanvas();
+                if (currentDecoder) {
+                    currentDecoder.close();
+                    currentDecoder = null;
                 }
             };
         }
 
-        // 清空画布（变黑）
         function clearCanvas() {
             ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -604,80 +1403,52 @@ async fn serve_html() -> impl IntoResponse {
                 ws.close();
                 ws = null;
             }
-            if (decoder) {
-                decoder.close();
-                decoder = null;
+            if (currentDecoder) {
+                currentDecoder.close();
+                currentDecoder = null;
             }
-            decoderReady = false;
             frameCount = 0;
             cachedSPS = null;
             cachedPPS = null;
-            clearCanvas();  // 断开连接时清空画布
-            // updateStatus('error', 'Disconnected');
+            clearCanvas();
         }
 
-        // function updateStatus(type, message) {
-        //     const statusEl = document.getElementById('status');
-        //     statusEl.className = type;
-        //     statusEl.textContent = message;
-        // }
-
-        // 触控事件处理
-        let activeTouches = new Map(); // 存储当前活动的触控点
+        // ========== 触控事件处理 ==========
+        let activeTouches = new Map();
 
         function setupTouchEvents() {
-            // 阻止默认的触摸行为
             canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
             canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
             canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
             canvas.addEventListener('touchcancel', handleTouchEnd, { passive: false });
 
-            // 添加鼠标事件支持（PC测试）
             canvas.addEventListener('mousedown', handleMouseDown);
             canvas.addEventListener('mousemove', handleMouseMove);
             canvas.addEventListener('mouseup', handleMouseUp);
             canvas.addEventListener('mouseleave', handleMouseUp);
         }
 
-        // 坐标转换：Canvas像素坐标 → 归一化坐标 [0, 1]
         function normalizeCoords(canvasX, canvasY) {
             const rect = canvas.getBoundingClientRect();
-            // 计算相对于canvas的位置
             const x = (canvasX - rect.left) / rect.width;
             const y = (canvasY - rect.top) / rect.height;
             return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
         }
 
-        // 发送触控事件到服务器
         function sendTouchEvent(action, pointerId, x, y, pressure = 1.0) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                console.warn('WebSocket not ready, cannot send touch event');
-                return;
-            }
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!deviceWidth || !deviceHeight) return;
 
-            if (!deviceWidth || !deviceHeight) {
-                console.warn('Device dimensions not set, cannot send touch event');
-                return;
-            }
-
-            // 根据 action 设置正确的 buttons 和 pressure
-            // 鼠标模式（官方scrcpy使用的模式）：
-            // DOWN: buttons=1, pressure=1.0
-            // UP:   buttons=0, pressure=0.0
-            // MOVE: buttons=1, pressure=1.0
             let buttons = 0;
             let actualPressure = pressure;
 
             if (action === 0) {
-                // DOWN: buttons=1, pressure=1.0
                 buttons = 1;
                 actualPressure = 1.0;
             } else if (action === 1) {
-                // UP: buttons=0, pressure=0.0
                 buttons = 0;
                 actualPressure = 0.0;
             } else if (action === 2) {
-                // MOVE: buttons=1, pressure=1.0
                 buttons = 1;
                 actualPressure = 1.0;
             }
@@ -689,24 +1460,19 @@ async fn serve_html() -> impl IntoResponse {
                 x: x,
                 y: y,
                 pressure: actualPressure,
-                width: videoWidth,   // 使用视频流分辨率（scrcpy server 期望的尺寸）
-                height: videoHeight, // 使用视频流分辨率（scrcpy server 期望的尺寸）
+                width: videoWidth,
+                height: videoHeight,
                 buttons: buttons
             };
 
-            const jsonStr = JSON.stringify(event);
-            ws.send(jsonStr);
+            ws.send(JSON.stringify(event));
         }
 
-        // 触摸事件处理器
         function handleTouchStart(e) {
             e.preventDefault();
             for (let touch of e.changedTouches) {
                 const coords = normalizeCoords(touch.clientX, touch.clientY);
                 activeTouches.set(touch.identifier, coords);
-
-                // 真实触摸事件使用正数ID (touch.identifier从0开始)
-                // Android ACTION_DOWN (0) 或 ACTION_POINTER_DOWN (5)
                 const action = activeTouches.size === 1 ? 0 : 5;
                 sendTouchEvent(action, touch.identifier, coords.x, coords.y, touch.force || 1.0);
             }
@@ -716,11 +1482,8 @@ async fn serve_html() -> impl IntoResponse {
             e.preventDefault();
             for (let touch of e.changedTouches) {
                 if (!activeTouches.has(touch.identifier)) continue;
-
                 const coords = normalizeCoords(touch.clientX, touch.clientY);
                 activeTouches.set(touch.identifier, coords);
-
-                // Android ACTION_MOVE (2)
                 sendTouchEvent(2, touch.identifier, coords.x, coords.y, touch.force || 1.0);
             }
         }
@@ -729,40 +1492,29 @@ async fn serve_html() -> impl IntoResponse {
             e.preventDefault();
             for (let touch of e.changedTouches) {
                 if (!activeTouches.has(touch.identifier)) continue;
-
                 const coords = activeTouches.get(touch.identifier);
                 activeTouches.delete(touch.identifier);
-
-                // Android ACTION_UP (1) 或 ACTION_POINTER_UP (6)
                 const action = activeTouches.size === 0 ? 1 : 6;
                 sendTouchEvent(action, touch.identifier, coords.x, coords.y, 1.0);
             }
         }
 
-        // 鼠标事件处理器（用于PC测试）
         let mouseDown = false;
-        // 使用官方scrcpy的鼠标ID: POINTER_ID_MOUSE = -1
         const MOUSE_POINTER_ID = -1;
 
         function handleMouseDown(e) {
             mouseDown = true;
             const coords = normalizeCoords(e.clientX, e.clientY);
             activeTouches.set(MOUSE_POINTER_ID, coords);
-            sendTouchEvent(0, MOUSE_POINTER_ID, coords.x, coords.y, 1.0); // ACTION_DOWN
+            sendTouchEvent(0, MOUSE_POINTER_ID, coords.x, coords.y, 1.0);
         }
 
         function handleMouseMove(e) {
             const coords = normalizeCoords(e.clientX, e.clientY);
             if (mouseDown) {
-                // 按下鼠标移动：ACTION_MOVE (2)
                 activeTouches.set(MOUSE_POINTER_ID, coords);
                 sendTouchEvent(2, MOUSE_POINTER_ID, coords.x, coords.y, 1.0);
             }
-            // 暂时禁用 HOVER_MOVE 以减少日志
-            // else {
-            //     // 未按下鼠标移动：ACTION_HOVER_MOVE (7)
-            //     sendTouchEvent(7, MOUSE_POINTER_ID, coords.x, coords.y, 1.0);
-            // }
         }
 
         function handleMouseUp(e) {
@@ -770,59 +1522,26 @@ async fn serve_html() -> impl IntoResponse {
             mouseDown = false;
             const coords = activeTouches.get(MOUSE_POINTER_ID) || normalizeCoords(e.clientX, e.clientY);
             activeTouches.delete(MOUSE_POINTER_ID);
-            sendTouchEvent(1, MOUSE_POINTER_ID, coords.x, coords.y, 1.0); // ACTION_UP
+            sendTouchEvent(1, MOUSE_POINTER_ID, coords.x, coords.y, 1.0);
         }
 
         // ========== 键盘事件处理 ==========
-
-        // JavaScript keyCode 到 Android keyCode 的映射
         const KEY_MAP = {
-            // 字母键 A-Z (Android: KEYCODE_A=29 到 KEYCODE_Z=54)
             'KeyA': 29, 'KeyB': 30, 'KeyC': 31, 'KeyD': 32, 'KeyE': 33,
             'KeyF': 34, 'KeyG': 35, 'KeyH': 36, 'KeyI': 37, 'KeyJ': 38,
             'KeyK': 39, 'KeyL': 40, 'KeyM': 41, 'KeyN': 42, 'KeyO': 43,
             'KeyP': 44, 'KeyQ': 45, 'KeyR': 46, 'KeyS': 47, 'KeyT': 48,
             'KeyU': 49, 'KeyV': 50, 'KeyW': 51, 'KeyX': 52, 'KeyY': 53, 'KeyZ': 54,
-
-            // 数字键 0-9 (Android: KEYCODE_0=7 到 KEYCODE_9=16)
             'Digit0': 7, 'Digit1': 8, 'Digit2': 9, 'Digit3': 10, 'Digit4': 11,
             'Digit5': 12, 'Digit6': 13, 'Digit7': 14, 'Digit8': 15, 'Digit9': 16,
-
-            // 功能键
-            'Enter': 66,        // KEYCODE_ENTER
-            'Backspace': 67,    // KEYCODE_DEL
-            'Delete': 112,      // KEYCODE_FORWARD_DEL
-            'Tab': 61,          // KEYCODE_TAB
-            'Space': 62,        // KEYCODE_SPACE
-            'Escape': 111,      // KEYCODE_ESCAPE
-
-            // 方向键
-            'ArrowUp': 19,      // KEYCODE_DPAD_UP
-            'ArrowDown': 20,    // KEYCODE_DPAD_DOWN
-            'ArrowLeft': 21,    // KEYCODE_DPAD_LEFT
-            'ArrowRight': 22,   // KEYCODE_DPAD_RIGHT
-
-            // 特殊键
-            'Home': 3,          // KEYCODE_HOME (Android Home)
-            'End': 123,         // KEYCODE_MOVE_END
-            'PageUp': 92,       // KEYCODE_PAGE_UP
-            'PageDown': 93,     // KEYCODE_PAGE_DOWN
-
-            // 符号键
-            'Comma': 55,        // KEYCODE_COMMA
-            'Period': 56,       // KEYCODE_PERIOD
-            'Slash': 76,        // KEYCODE_SLASH
-            'Semicolon': 74,    // KEYCODE_SEMICOLON
-            'Quote': 75,        // KEYCODE_APOSTROPHE
-            'BracketLeft': 71,  // KEYCODE_LEFT_BRACKET
-            'BracketRight': 72, // KEYCODE_RIGHT_BRACKET
-            'Backslash': 73,    // KEYCODE_BACKSLASH
-            'Minus': 69,        // KEYCODE_MINUS
-            'Equal': 70,        // KEYCODE_EQUALS
-            'Backquote': 68,    // KEYCODE_GRAVE
+            'Enter': 66, 'Backspace': 67, 'Delete': 112, 'Tab': 61, 'Space': 62, 'Escape': 111,
+            'ArrowUp': 19, 'ArrowDown': 20, 'ArrowLeft': 21, 'ArrowRight': 22,
+            'Home': 3, 'End': 123, 'PageUp': 92, 'PageDown': 93,
+            'Comma': 55, 'Period': 56, 'Slash': 76, 'Semicolon': 74, 'Quote': 75,
+            'BracketLeft': 71, 'BracketRight': 72, 'Backslash': 73,
+            'Minus': 69, 'Equal': 70, 'Backquote': 68,
         };
 
-        // Android 修饰键状态
         const META_SHIFT = 1;
         const META_CTRL = 4096;
         const META_ALT = 2;
@@ -837,30 +1556,25 @@ async fn serve_html() -> impl IntoResponse {
 
         function sendKeyEvent(action, keycode, metastate) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-            const event = {
+            ws.send(JSON.stringify({
                 type: 'key',
                 action: action,
                 keycode: keycode,
                 repeat: 0,
                 metastate: metastate
-            };
-            ws.send(JSON.stringify(event));
+            }));
         }
 
         function handleKeyDown(e) {
-            // 处理 Ctrl+V 粘贴
             if (e.ctrlKey && e.code === 'KeyV') {
                 e.preventDefault();
                 handlePaste();
                 return;
             }
-
             const keycode = KEY_MAP[e.code];
             if (keycode !== undefined) {
                 e.preventDefault();
-                const meta = getMetaState(e);
-                sendKeyEvent(0, keycode, meta); // ACTION_DOWN
+                sendKeyEvent(0, keycode, getMetaState(e));
             }
         }
 
@@ -868,108 +1582,71 @@ async fn serve_html() -> impl IntoResponse {
             const keycode = KEY_MAP[e.code];
             if (keycode !== undefined) {
                 e.preventDefault();
-                const meta = getMetaState(e);
-                sendKeyEvent(1, keycode, meta); // ACTION_UP
+                sendKeyEvent(1, keycode, getMetaState(e));
             }
         }
 
-        // ========== 文本输入和粘贴功能 ==========
-
+        // ========== 文本输入和粘贴 ==========
         function sendText(text) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-            const event = {
-                type: 'text',
-                text: text
-            };
-            ws.send(JSON.stringify(event));
+            ws.send(JSON.stringify({ type: 'text', text: text }));
             console.log('📝 Sent text:', text.length, 'chars');
         }
 
         function setClipboard(text, paste) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-            const event = {
-                type: 'clipboard',
-                text: text,
-                paste: paste
-            };
-            ws.send(JSON.stringify(event));
-            console.log('📋 Set clipboard:', text.length, 'chars, paste:', paste);
+            ws.send(JSON.stringify({ type: 'clipboard', text: text, paste: paste }));
         }
 
         async function handlePaste() {
             try {
                 const text = await navigator.clipboard.readText();
-                if (text) {
-                    // 直接注入文本（更可靠）
-                    sendText(text);
-                }
+                if (text) sendText(text);
             } catch (e) {
                 console.error('Failed to read clipboard:', e);
             }
         }
 
-        // 设置键盘事件
         function setupKeyboardEvents() {
             document.addEventListener('keydown', handleKeyDown);
             document.addEventListener('keyup', handleKeyUp);
-
-            // 监听粘贴事件
             document.addEventListener('paste', async (e) => {
                 e.preventDefault();
                 const text = e.clipboardData.getData('text');
-                if (text) {
-                    sendText(text);
-                }
+                if (text) sendText(text);
             });
         }
 
-        // ========== 滚轮滚动功能 ==========
-
+        // ========== 滚轮滚动 ==========
         function sendScrollEvent(x, y, hscroll, vscroll) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (!videoWidth || !videoHeight) return;
-
-            const event = {
+            ws.send(JSON.stringify({
                 type: 'scroll',
-                x: x,
-                y: y,
-                width: videoWidth,
-                height: videoHeight,
-                hscroll: hscroll,
-                vscroll: vscroll
-            };
-            ws.send(JSON.stringify(event));
+                x: x, y: y,
+                width: videoWidth, height: videoHeight,
+                hscroll: hscroll, vscroll: vscroll
+            }));
         }
 
         function handleWheel(e) {
             e.preventDefault();
-
             const coords = normalizeCoords(e.clientX, e.clientY);
-
-            // 将滚轮 deltaY 转换为滚动量
-            // deltaY > 0 表示向下滚动，对应 vscroll < 0
-            // deltaY < 0 表示向上滚动，对应 vscroll > 0
             const vscroll = e.deltaY > 0 ? -1 : (e.deltaY < 0 ? 1 : 0);
             const hscroll = e.deltaX > 0 ? -1 : (e.deltaX < 0 ? 1 : 0);
-
             if (vscroll !== 0 || hscroll !== 0) {
                 sendScrollEvent(coords.x, coords.y, hscroll, vscroll);
             }
         }
 
-        // 设置滚轮事件
         function setupScrollEvents() {
             canvas.addEventListener('wheel', handleWheel, { passive: false });
         }
 
-        // 在连接成功后设置触控事件
+        // ========== 初始化 ==========
         setupTouchEvents();
         setupKeyboardEvents();
         setupScrollEvents();
-
-        // 自动连接
         connect();
     </script>
 </body>
@@ -977,4 +1654,16 @@ async fn serve_html() -> impl IntoResponse {
     "#;
 
     ([("content-type", "text/html; charset=utf-8")], html)
+}
+
+/// 提供 Broadway Decoder.min.js
+async fn serve_broadway_decoder() -> impl IntoResponse {
+    let js = include_str!("../decoder/Decoder.min.js");
+    ([("content-type", "application/javascript; charset=utf-8")], js)
+}
+
+/// 提供 JMuxer jmuxer.min.js
+async fn serve_jmuxer() -> impl IntoResponse {
+    let js = include_str!("../decoder/jmuxer.min.js");
+    ([("content-type", "application/javascript; charset=utf-8")], js)
 }

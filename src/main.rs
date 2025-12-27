@@ -89,6 +89,12 @@ struct Args {
     /// 日志级别 (trace, debug, info, warn, error)
     #[arg(short = 'l', long, default_value = "info")]
     log_level: String,
+
+    /// Listen on all network interfaces (0.0.0.0) for LAN access
+    ///
+    /// 监听所有网络接口（0.0.0.0），允许局域网访问
+    #[arg(long)]
+    public: bool,
 }
 
 #[tokio::main]
@@ -129,6 +135,7 @@ async fn main() -> Result<()> {
     info!("   Control port: {}", args.control_port);
     info!("   IDR interval: {}s", args.intra_refresh_period);
     info!("   Log level: {}", args.log_level);
+    info!("   Public mode: {}", if args.public { "Yes (LAN accessible)" } else { "No (localhost only)" });
 
     // 获取ADB路径
     if !args.adb_path.exists() {
@@ -250,7 +257,7 @@ async fn main() -> Result<()> {
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<scrcpy::control::ControlEvent>(100);
 
     // 创建 WebSocket 服务器（自动寻找可用端口）
-    let ws_server = WebSocketServer::new(args.ws_port, idr_request_tx, control_tx, device_width, device_height)?;
+    let ws_server = WebSocketServer::new(args.ws_port, idr_request_tx, control_tx, device_width, device_height, args.public)?;
     let actual_ws_port = ws_server.get_actual_port();
     let frame_sender = ws_server.get_sender();
     let config_sender = ws_server.get_config_sender();

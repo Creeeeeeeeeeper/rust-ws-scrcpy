@@ -1,4 +1,4 @@
-其他依赖：**adb**（任意版本），**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对），需要浏览器支持**Webcodecs API**，否则无法在浏览器看到画面。*adb和scrcpy-server注意路径，--help中会有提示*
+其他依赖：**adb**（任意版本），**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对）。*adb和scrcpy-server注意路径，--help中会有提示*
 
 <p align="center">
   <img width="220"
@@ -46,25 +46,26 @@ Rust-Scrcpy 是一个用 Rust 实现的 Android 屏幕镜像系统，通过 ADB 
 ### 核心特性
 
 - **实时屏幕镜像**: 低延迟 H.264 视频流传输
+- **多解码器支持**: WebCodecs（硬件加速）、JMuxer（MSE）、Broadway（软解码）自动降级
 - **双向控制**: 支持触摸、鼠标、按键事件（仅单点控制）
 - **键盘输入**: 支持字母、数字、功能键、方向键等
 - **剪贴板粘贴**: 支持 Ctrl+V 快速粘贴文本到手机
 - **鼠标滚轮**: 支持滚轮滚动，方便浏览网页和列表
 - **屏幕旋转适配**: 自动检测横竖屏切换并调整显示
-- **Web 客户端**: 基于 WebCodecs API 的浏览器内解码
+- **Web 客户端**: 多解码器自动降级，兼容所有现代浏览器
 - **多客户端支持**: 使用 broadcast channel 同时向多个客户端推流
 - **自动 IDR 帧请求**: 新客户端连接时自动获取关键帧，提高画面响应速度
 - **自动端口**：自动跳过占用的端口，使用未被占用的端口
 
 ### 技术栈
 
-| 组件           | 技术                       |
-| -------------- | -------------------------- |
-| 后端运行时     | Tokio (异步)               |
-| HTTP/WebSocket | Axum                       |
-| 视频编码       | H.264 (Android MediaCodec) |
-| 前端解码       | WebCodecs API              |
-| 进程通信       | ADB forward + TCP          |
+| 组件           | 技术                                                  |
+| -------------- | ----------------------------------------------------- |
+| 后端运行时     | Tokio (异步)                                          |
+| HTTP/WebSocket | Axum                                                  |
+| 视频编码       | H.264 (Android MediaCodec)                            |
+| 前端解码       | WebCodecs / JMuxer (MSE) / Broadway.js（自动降级）    |
+| 进程通信       | ADB forward + TCP                                     |
 
 ---
 
@@ -1181,6 +1182,30 @@ async fn handle_client(
 
 ## 9. 前端解码与渲染
 
+### 9.0 多解码器架构
+
+系统支持三种解码器，按优先级自动降级：
+
+| 解码器     | 优先级 | 特点                     | 兼容性                    |
+| ---------- | ------ | ------------------------ | ------------------------- |
+| WebCodecs  | 1      | 硬件加速，CPU 占用极低   | Chrome 94+, Edge 94+      |
+| JMuxer     | 2      | MSE，浏览器原生解码      | 支持 MSE 的现代浏览器     |
+| Broadway   | 3      | 纯 JS 软解码，兼容性最好 | 几乎所有浏览器            |
+
+用户可通过 URL 参数指定解码器：`?decoder=webcodecs` / `?decoder=jmuxer` / `?decoder=broadway`
+
+```javascript
+// 解码器管理器 - 自动检测和降级
+const DecoderManager = {
+    getBestDecoder() {
+        if (WebCodecsDecoder.isSupported()) return 'webcodecs';
+        if (JMuxerDecoder.isSupported()) return 'jmuxer';
+        if (BroadwayDecoder.isSupported()) return 'broadway';
+        return null;
+    }
+};
+```
+
 ### 9.1 WebCodecs 解码流程
 
 ```javascript
@@ -1593,19 +1618,20 @@ if frame.frame_type == FrameType::Config {
 
 ### 12.1 命令行参数
 
-| 参数                     | 短选项 | 默认值                                  | 说明                   |
-| ------------------------ | ------ | --------------------------------------- | ---------------------- |
-| `--adb-path`             | `-a`   | `../adb/adb.exe`                        | ADB 可执行文件路径     |
-| `--server-path`          | `-s`   | `../scrcpy-server/scrcpy-server-v3.3.4` | scrcpy-server JAR 路径 |
-| `--device`               | `-d`   | (自动选择)                              | 目标设备序列号         |
-| `--max-size`             | `-m`   | `1920`                                  | 最大视频分辨率         |
-| `--bit-rate`             | `-b`   | `4000000`                               | 视频码率 (bps)         |
-| `--max-fps`              | `-f`   | `60`                                    | 最大帧率               |
-| `--ws-port`              | `-p`   | `8080`                                  | WebSocket 端口         |
-| `--video-port`           |        | `27183`                                 | 视频流端口             |
-| `--control-port`         |        | `27184`                                 | 控制流端口             |
-| `--intra-refresh-period` | `-i`   | `1`                                     | IDR 帧间隔 (秒)        |
-| `--log-level`            | `-l`   | `info`                                  | 日志级别               |
+| 参数                     | 短选项 | 默认值                                  | 说明                         |
+| ------------------------ | ------ | --------------------------------------- | ---------------------------- |
+| `--adb-path`             | `-a`   | `../adb/adb.exe`                        | ADB 可执行文件路径           |
+| `--server-path`          | `-s`   | `../scrcpy-server/scrcpy-server-v3.3.4` | scrcpy-server JAR 路径       |
+| `--device`               | `-d`   | (自动选择)                              | 目标设备序列号               |
+| `--max-size`             | `-m`   | `1920`                                  | 最大视频分辨率               |
+| `--bit-rate`             | `-b`   | `4000000`                               | 视频码率 (bps)               |
+| `--max-fps`              | `-f`   | `60`                                    | 最大帧率                     |
+| `--ws-port`              | `-p`   | `8080`                                  | WebSocket 端口               |
+| `--video-port`           |        | `27183`                                 | 视频流端口                   |
+| `--control-port`         |        | `27184`                                 | 控制流端口                   |
+| `--intra-refresh-period` | `-i`   | `1`                                     | IDR 帧间隔 (秒)              |
+| `--log-level`            | `-l`   | `info`                                  | 日志级别                     |
+| `--public`               |        | (不启用)                                | 启用局域网访问 (0.0.0.0)     |
 
 ### 12.2 性能调优建议
 
