@@ -20,7 +20,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "Rust-ws-scrcpy")]
 #[command(author = "zzzzyg")]
-#[command(version = "2.0.3")]
+#[command(version = "2.1.0")]
 #[command(about = "Stream Android device screen to web browsers via WebSocket", long_about = None)]
 #[command(help_template = "{name} {version}\nAuthor: {author}\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}")]
 struct Args {
