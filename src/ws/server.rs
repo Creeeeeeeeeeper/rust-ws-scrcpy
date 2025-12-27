@@ -1,5 +1,5 @@
 use crate::error::{Result, ScrcpyError};
-use crate::scrcpy::control::TouchEvent;
+use crate::scrcpy::control::ControlEvent;
 use crate::utils::find_available_port;
 use axum::{
     extract::ws::{WebSocket, WebSocketUpgrade, Message},
@@ -37,8 +37,8 @@ pub struct WebSocketServer {
     video_config: Arc<RwLock<VideoConfig>>,
     // 用于请求IDR帧的通道
     idr_request_tx: mpsc::Sender<()>,
-    // 用于发送触控事件的通道
-    control_tx: mpsc::Sender<TouchEvent>,
+    // 用于发送控制事件的通道
+    control_tx: mpsc::Sender<ControlEvent>,
 }
 
 impl WebSocketServer {
@@ -47,7 +47,7 @@ impl WebSocketServer {
     /// # Arguments
     /// * `port` - 期望的端口号，如果被占用会自动向后寻找
     /// * `max_port_attempts` - 端口搜索的最大尝试次数
-    pub fn new(port: u16, idr_request_tx: mpsc::Sender<()>, control_tx: mpsc::Sender<TouchEvent>, device_width: u32, device_height: u32) -> Result<Self> {
+    pub fn new(port: u16, idr_request_tx: mpsc::Sender<()>, control_tx: mpsc::Sender<ControlEvent>, device_width: u32, device_height: u32) -> Result<Self> {
         // 自动寻找可用端口
         let actual_port = find_available_port(port, 100)?;
 
@@ -133,7 +133,7 @@ async fn handle_socket(
     config_tx: broadcast::Sender<String>,
     video_config: Arc<RwLock<VideoConfig>>,
     idr_request_tx: mpsc::Sender<()>,
-    control_tx: mpsc::Sender<TouchEvent>,
+    control_tx: mpsc::Sender<ControlEvent>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_client(socket, tx, config_tx, video_config, idr_request_tx, control_tx))
 }
@@ -145,7 +145,7 @@ async fn handle_client(
     config_tx: broadcast::Sender<String>,
     video_config: Arc<RwLock<VideoConfig>>,
     idr_request_tx: mpsc::Sender<()>,
-    control_tx: mpsc::Sender<TouchEvent>,
+    control_tx: mpsc::Sender<ControlEvent>,
 ) {
     info!("📱 New WebSocket client connected");
 
@@ -263,11 +263,10 @@ async fn handle_client(
                     Some(Ok(Message::Text(text))) => {
                         // 解析控制事件JSON
                         debug!("📥 Received control message: {}", text);
-                        match serde_json::from_str::<TouchEvent>(&text) {
-                            Ok(touch_event) => {
-                                debug!("✅ Parsed touch event: action={:?}, pointer_id={}, x={}, y={}",
-                                    touch_event.action, touch_event.pointer_id, touch_event.x, touch_event.y);
-                                if let Err(e) = control_tx.send(touch_event).await {
+                        match serde_json::from_str::<ControlEvent>(&text) {
+                            Ok(control_event) => {
+                                debug!("✅ Parsed control event: {:?}", control_event);
+                                if let Err(e) = control_tx.send(control_event).await {
                                     warn!("Failed to forward control event: {}", e);
                                 }
                             }
@@ -684,6 +683,7 @@ async fn serve_html() -> impl IntoResponse {
             }
 
             const event = {
+                type: 'touch',
                 action: action,
                 pointer_id: pointerId,
                 x: x,
@@ -773,8 +773,161 @@ async fn serve_html() -> impl IntoResponse {
             sendTouchEvent(1, MOUSE_POINTER_ID, coords.x, coords.y, 1.0); // ACTION_UP
         }
 
+        // ========== 键盘事件处理 ==========
+
+        // JavaScript keyCode 到 Android keyCode 的映射
+        const KEY_MAP = {
+            // 字母键 A-Z (Android: KEYCODE_A=29 到 KEYCODE_Z=54)
+            'KeyA': 29, 'KeyB': 30, 'KeyC': 31, 'KeyD': 32, 'KeyE': 33,
+            'KeyF': 34, 'KeyG': 35, 'KeyH': 36, 'KeyI': 37, 'KeyJ': 38,
+            'KeyK': 39, 'KeyL': 40, 'KeyM': 41, 'KeyN': 42, 'KeyO': 43,
+            'KeyP': 44, 'KeyQ': 45, 'KeyR': 46, 'KeyS': 47, 'KeyT': 48,
+            'KeyU': 49, 'KeyV': 50, 'KeyW': 51, 'KeyX': 52, 'KeyY': 53, 'KeyZ': 54,
+
+            // 数字键 0-9 (Android: KEYCODE_0=7 到 KEYCODE_9=16)
+            'Digit0': 7, 'Digit1': 8, 'Digit2': 9, 'Digit3': 10, 'Digit4': 11,
+            'Digit5': 12, 'Digit6': 13, 'Digit7': 14, 'Digit8': 15, 'Digit9': 16,
+
+            // 功能键
+            'Enter': 66,        // KEYCODE_ENTER
+            'Backspace': 67,    // KEYCODE_DEL
+            'Delete': 112,      // KEYCODE_FORWARD_DEL
+            'Tab': 61,          // KEYCODE_TAB
+            'Space': 62,        // KEYCODE_SPACE
+            'Escape': 111,      // KEYCODE_ESCAPE
+
+            // 方向键
+            'ArrowUp': 19,      // KEYCODE_DPAD_UP
+            'ArrowDown': 20,    // KEYCODE_DPAD_DOWN
+            'ArrowLeft': 21,    // KEYCODE_DPAD_LEFT
+            'ArrowRight': 22,   // KEYCODE_DPAD_RIGHT
+
+            // 特殊键
+            'Home': 3,          // KEYCODE_HOME (Android Home)
+            'End': 123,         // KEYCODE_MOVE_END
+            'PageUp': 92,       // KEYCODE_PAGE_UP
+            'PageDown': 93,     // KEYCODE_PAGE_DOWN
+
+            // 符号键
+            'Comma': 55,        // KEYCODE_COMMA
+            'Period': 56,       // KEYCODE_PERIOD
+            'Slash': 76,        // KEYCODE_SLASH
+            'Semicolon': 74,    // KEYCODE_SEMICOLON
+            'Quote': 75,        // KEYCODE_APOSTROPHE
+            'BracketLeft': 71,  // KEYCODE_LEFT_BRACKET
+            'BracketRight': 72, // KEYCODE_RIGHT_BRACKET
+            'Backslash': 73,    // KEYCODE_BACKSLASH
+            'Minus': 69,        // KEYCODE_MINUS
+            'Equal': 70,        // KEYCODE_EQUALS
+            'Backquote': 68,    // KEYCODE_GRAVE
+        };
+
+        // Android 修饰键状态
+        const META_SHIFT = 1;
+        const META_CTRL = 4096;
+        const META_ALT = 2;
+
+        function getMetaState(e) {
+            let meta = 0;
+            if (e.shiftKey) meta |= META_SHIFT;
+            if (e.ctrlKey) meta |= META_CTRL;
+            if (e.altKey) meta |= META_ALT;
+            return meta;
+        }
+
+        function sendKeyEvent(action, keycode, metastate) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const event = {
+                type: 'key',
+                action: action,
+                keycode: keycode,
+                repeat: 0,
+                metastate: metastate
+            };
+            ws.send(JSON.stringify(event));
+        }
+
+        function handleKeyDown(e) {
+            // 处理 Ctrl+V 粘贴
+            if (e.ctrlKey && e.code === 'KeyV') {
+                e.preventDefault();
+                handlePaste();
+                return;
+            }
+
+            const keycode = KEY_MAP[e.code];
+            if (keycode !== undefined) {
+                e.preventDefault();
+                const meta = getMetaState(e);
+                sendKeyEvent(0, keycode, meta); // ACTION_DOWN
+            }
+        }
+
+        function handleKeyUp(e) {
+            const keycode = KEY_MAP[e.code];
+            if (keycode !== undefined) {
+                e.preventDefault();
+                const meta = getMetaState(e);
+                sendKeyEvent(1, keycode, meta); // ACTION_UP
+            }
+        }
+
+        // ========== 文本输入和粘贴功能 ==========
+
+        function sendText(text) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const event = {
+                type: 'text',
+                text: text
+            };
+            ws.send(JSON.stringify(event));
+            console.log('📝 Sent text:', text.length, 'chars');
+        }
+
+        function setClipboard(text, paste) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const event = {
+                type: 'clipboard',
+                text: text,
+                paste: paste
+            };
+            ws.send(JSON.stringify(event));
+            console.log('📋 Set clipboard:', text.length, 'chars, paste:', paste);
+        }
+
+        async function handlePaste() {
+            try {
+                const text = await navigator.clipboard.readText();
+                if (text) {
+                    // 直接注入文本（更可靠）
+                    sendText(text);
+                }
+            } catch (e) {
+                console.error('Failed to read clipboard:', e);
+            }
+        }
+
+        // 设置键盘事件
+        function setupKeyboardEvents() {
+            document.addEventListener('keydown', handleKeyDown);
+            document.addEventListener('keyup', handleKeyUp);
+
+            // 监听粘贴事件
+            document.addEventListener('paste', async (e) => {
+                e.preventDefault();
+                const text = e.clipboardData.getData('text');
+                if (text) {
+                    sendText(text);
+                }
+            });
+        }
+
         // 在连接成功后设置触控事件
         setupTouchEvents();
+        setupKeyboardEvents();
 
         // 自动连接
         connect();

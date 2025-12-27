@@ -128,6 +128,34 @@ pub struct KeyEvent {
     pub metastate: u32,
 }
 
+// 文本输入事件（从WebSocket接收）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextEvent {
+    pub text: String,
+}
+
+// 剪贴板事件（从WebSocket接收）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardEvent {
+    pub text: String,
+    #[serde(default)]
+    pub paste: bool,  // 是否同时模拟粘贴操作
+}
+
+// 统一的控制事件类型（从WebSocket接收）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ControlEvent {
+    #[serde(rename = "touch")]
+    Touch(TouchEvent),
+    #[serde(rename = "key")]
+    Key(KeyEvent),
+    #[serde(rename = "text")]
+    Text(TextEvent),
+    #[serde(rename = "clipboard")]
+    Clipboard(ClipboardEvent),
+}
+
 pub struct ControlChannel {
     stream: TcpStream,
 }
@@ -357,6 +385,70 @@ impl ControlChannel {
             repeat: 0,
             metastate: 0,
         }).await?;
+
+        Ok(())
+    }
+
+    /// 发送文本注入事件（直接输入文字）
+    /// scrcpy 3.x 文本消息格式：
+    /// [type=1][length:4][text:variable]
+    pub async fn send_text(&mut self, text: &str) -> Result<()> {
+        info!("📝 Sending text: {} chars", text.len());
+
+        let text_bytes = text.as_bytes();
+        let mut msg = Vec::with_capacity(5 + text_bytes.len());
+
+        // 1. 消息类型 (1 byte) = InjectText (1)
+        msg.push(ControlMessageType::InjectText as u8);
+
+        // 2. 文本长度 (4 bytes, Big Endian)
+        msg.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+
+        // 3. 文本内容 (variable)
+        msg.extend_from_slice(text_bytes);
+
+        debug!("📤 Text message ({} bytes)", msg.len());
+
+        self.stream.write_all(&msg).await
+            .map_err(|e| ScrcpyError::Network(format!("Failed to send text: {}", e)))?;
+
+        self.stream.flush().await
+            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 设置设备剪贴板内容
+    /// scrcpy 3.x 剪贴板消息格式：
+    /// [type=8][sequence:8][paste:1][length:4][text:variable]
+    pub async fn set_clipboard(&mut self, text: &str, paste: bool) -> Result<()> {
+        info!("📋 Setting clipboard: {} chars, paste={}", text.len(), paste);
+
+        let text_bytes = text.as_bytes();
+        let mut msg = Vec::with_capacity(14 + text_bytes.len());
+
+        // 1. 消息类型 (1 byte) = SetClipboard (8)
+        msg.push(ControlMessageType::SetClipboard as u8);
+
+        // 2. sequence (8 bytes, Big Endian) - 用于同步，这里使用0
+        msg.extend_from_slice(&0u64.to_be_bytes());
+
+        // 3. paste标志 (1 byte) - 是否模拟粘贴操作
+        msg.push(if paste { 1 } else { 0 });
+
+        // 4. 文本长度 (4 bytes, Big Endian)
+        msg.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+
+        // 5. 文本内容 (variable)
+        msg.extend_from_slice(text_bytes);
+
+        debug!("📤 Clipboard message ({} bytes)", msg.len());
+
+        self.stream.write_all(&msg).await
+            .map_err(|e| ScrcpyError::Network(format!("Failed to set clipboard: {}", e)))?;
+
+        self.stream.flush().await
+            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
 
         Ok(())
     }

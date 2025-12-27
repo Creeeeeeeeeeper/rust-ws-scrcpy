@@ -26,6 +26,12 @@
 5. [Scrcpy Server协议](#5-scrcpy-server协议)
 6. [视频流处理](#6-视频流处理)
 7. [控制流处理](#7-控制流处理)
+   - [7.7 文本注入协议](#77-文本注入协议)
+   - [7.8 剪贴板设置协议](#78-剪贴板设置协议)
+   - [7.9 统一控制事件类型](#79-统一控制事件类型)
+   - [7.10 键盘输入支持](#710-键盘输入支持)
+   - [7.11 剪贴板粘贴功能](#711-剪贴板粘贴功能)
+   - [7.5 屏幕旋转自动适配](#75-屏幕旋转自动适配)
 8. [WebSocket通信](#8-websocket通信)
 9. [前端解码与渲染](#9-前端解码与渲染)
 10. [数据流转图](#10-数据流转图)
@@ -44,6 +50,9 @@ Rust-Scrcpy 是一个用 Rust 实现的 Android 屏幕镜像系统，通过 ADB 
 
 - **实时屏幕镜像**: 低延迟 H.264 视频流传输
 - **双向控制**: 支持触摸、鼠标、按键事件（仅单点控制）
+- **键盘输入**: 支持字母、数字、功能键、方向键等
+- **剪贴板粘贴**: 支持 Ctrl+V 快速粘贴文本到手机
+- **屏幕旋转适配**: 自动检测横竖屏切换并调整显示
 - **Web 客户端**: 基于 WebCodecs API 的浏览器内解码
 - **多客户端支持**: 使用 broadcast channel 同时向多个客户端推流
 - **自动 IDR 帧请求**: 新客户端连接时自动获取关键帧，提高画面响应速度
@@ -698,6 +707,256 @@ impl ControlChannel {
         self.stream.flush().await?;
 
         Ok(())
+    }
+}
+```
+
+### 7.7 文本注入协议
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Text Inject Message Format                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Offset │ Size │ Field   │ Type      │ Description                      │
+│  ───────┼──────┼─────────┼───────────┼───────────────────────────────── │
+│    0    │  1   │ type    │ u8        │ = 1 (InjectText)                 │
+│    1    │  4   │ length  │ u32 BE    │ 文本字节长度                      │
+│    5    │  N   │ text    │ [u8; N]   │ UTF-8 编码的文本内容              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.8 剪贴板设置协议
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   Set Clipboard Message Format                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Offset │ Size │ Field    │ Type      │ Description                     │
+│  ───────┼──────┼──────────┼───────────┼──────────────────────────────── │
+│    0    │  1   │ type     │ u8        │ = 8 (SetClipboard)              │
+│    1    │  8   │ sequence │ u64 BE    │ 同步序列号 (通常为0)             │
+│    9    │  1   │ paste    │ u8        │ 0=仅设置, 1=设置并粘贴           │
+│   10    │  4   │ length   │ u32 BE    │ 文本字节长度                     │
+│   14    │  N   │ text     │ [u8; N]   │ UTF-8 编码的文本内容             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.9 统一控制事件类型
+
+为了支持多种控制事件，使用统一的枚举类型：
+
+```rust
+// src/scrcpy/control.rs
+
+// 文本输入事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextEvent {
+    pub text: String,
+}
+
+// 剪贴板事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardEvent {
+    pub text: String,
+    pub paste: bool,  // 是否同时模拟粘贴操作
+}
+
+// 统一的控制事件类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ControlEvent {
+    #[serde(rename = "touch")]
+    Touch(TouchEvent),
+    #[serde(rename = "key")]
+    Key(KeyEvent),
+    #[serde(rename = "text")]
+    Text(TextEvent),
+    #[serde(rename = "clipboard")]
+    Clipboard(ClipboardEvent),
+}
+```
+
+### 7.10 键盘输入支持
+
+前端 JavaScript 键盘映射表：
+
+```javascript
+const KEY_MAP = {
+    // 字母键 A-Z (Android: KEYCODE_A=29 到 KEYCODE_Z=54)
+    'KeyA': 29, 'KeyB': 30, 'KeyC': 31, /* ... */ 'KeyZ': 54,
+
+    // 数字键 0-9 (Android: KEYCODE_0=7 到 KEYCODE_9=16)
+    'Digit0': 7, 'Digit1': 8, /* ... */ 'Digit9': 16,
+
+    // 功能键
+    'Enter': 66,        // KEYCODE_ENTER
+    'Backspace': 67,    // KEYCODE_DEL
+    'Delete': 112,      // KEYCODE_FORWARD_DEL
+    'Tab': 61,          // KEYCODE_TAB
+    'Space': 62,        // KEYCODE_SPACE
+    'Escape': 111,      // KEYCODE_ESCAPE
+
+    // 方向键
+    'ArrowUp': 19,      // KEYCODE_DPAD_UP
+    'ArrowDown': 20,    // KEYCODE_DPAD_DOWN
+    'ArrowLeft': 21,    // KEYCODE_DPAD_LEFT
+    'ArrowRight': 22,   // KEYCODE_DPAD_RIGHT
+
+    // 符号键
+    'Comma': 55, 'Period': 56, 'Slash': 76, /* ... */
+};
+
+// 修饰键状态
+const META_SHIFT = 1;
+const META_CTRL = 4096;
+const META_ALT = 2;
+```
+
+### 7.11 剪贴板粘贴功能
+
+前端支持两种粘贴方式：
+
+```javascript
+// 方式1: Ctrl+V 快捷键
+document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.code === 'KeyV') {
+        e.preventDefault();
+        handlePaste();
+    }
+});
+
+// 方式2: 粘贴事件
+document.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const text = e.clipboardData.getData('text');
+    if (text) sendText(text);
+});
+
+// 粘贴处理函数
+async function handlePaste() {
+    const text = await navigator.clipboard.readText();
+    if (text) {
+        sendText(text);  // 使用 InjectText 直接输入
+    }
+}
+```
+
+---
+
+## 7.5 屏幕旋转自动适配
+
+### 7.5.1 功能概述
+
+当手机屏幕旋转（如播放视频全屏）时，系统会自动检测分辨率变化并通知前端调整 canvas 布局。
+
+### 7.5.2 后端检测机制
+
+```rust
+// src/main.rs - SPS 解析时检测旋转
+if let Some((width, height)) = parse_sps_resolution(&frame.data) {
+    let new_is_landscape = width > height;
+    let resolution_changed = config.width != width || config.height != height;
+    let orientation_changed = config.is_landscape != new_is_landscape;
+
+    if resolution_changed || orientation_changed {
+        config.width = width;
+        config.height = height;
+        config.is_landscape = new_is_landscape;
+
+        // 广播配置更新给所有客户端
+        let config_msg = format!(
+            r#"{{"type":"config","width":{},"height":{},"is_landscape":{}}}"#,
+            width, height, new_is_landscape
+        );
+        config_sender.send(config_msg);
+    }
+}
+```
+
+### 7.5.3 VideoConfig 结构
+
+```rust
+// src/ws/server.rs
+pub struct VideoConfig {
+    pub sps: Option<Bytes>,
+    pub pps: Option<Bytes>,
+    pub width: u32,           // 视频流分辨率
+    pub height: u32,
+    pub device_width: u32,    // 设备物理分辨率
+    pub device_height: u32,
+    pub is_landscape: bool,   // 是否为横屏模式
+}
+```
+
+### 7.5.4 前端自适应布局
+
+```javascript
+let isLandscape = false;
+
+function resizeCanvas() {
+    if (videoWidth > 0 && videoHeight > 0) {
+        const videoRatio = videoWidth / videoHeight;
+        const windowRatio = window.innerWidth / window.innerHeight;
+
+        // 根据视频和窗口的宽高比来决定如何适配
+        if (videoRatio > windowRatio) {
+            // 横屏视频在窄窗口，按宽度填满
+            canvas.style.width = '100vw';
+            canvas.style.height = `${window.innerWidth / videoRatio}px`;
+        } else {
+            // 竖屏视频，按高度填满
+            canvas.style.height = '100vh';
+            canvas.style.width = `${window.innerHeight * videoRatio}px`;
+        }
+    }
+}
+
+// 处理配置消息
+ws.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'config') {
+            videoWidth = msg.width;
+            videoHeight = msg.height;
+            isLandscape = msg.is_landscape || false;
+
+            canvas.width = msg.width;
+            canvas.height = msg.height;
+            resizeCanvas();  // 重新调整布局
+        }
+    }
+};
+```
+
+### 7.5.5 配置变化广播机制
+
+```rust
+// src/ws/server.rs - 添加配置广播通道
+pub struct WebSocketServer {
+    tx: broadcast::Sender<Bytes>,           // 视频帧广播
+    config_tx: broadcast::Sender<String>,   // 配置变化广播
+    // ...
+}
+
+// handle_client 中监听配置变化
+loop {
+    tokio::select! {
+        // 接收配置变化并发送给客户端
+        config_result = config_rx.recv() => {
+            if let Ok(config_msg) = config_result {
+                socket.send(Message::Text(config_msg)).await;
+            }
+        }
+
+        // 接收视频帧并发送
+        frame_result = rx.recv() => { /* ... */ }
+
+        // 监听客户端消息
+        msg = socket.recv() => { /* ... */ }
     }
 }
 ```

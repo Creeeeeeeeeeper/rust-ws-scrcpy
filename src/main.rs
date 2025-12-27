@@ -20,7 +20,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "Rust-ws-scrcpy")]
 #[command(author = "zzzzyg")]
-#[command(version = "2.0.1")]
+#[command(version = "2.0.2")]
 #[command(about = "Stream Android device screen to web browsers via WebSocket", long_about = None)]
 #[command(help_template = "{name} {version}\nAuthor: {author}\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}")]
 struct Args {
@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
     let (idr_request_tx, mut idr_request_rx) = tokio::sync::mpsc::channel::<()>(10);
 
     // 创建控制事件通道
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<scrcpy::control::TouchEvent>(100);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<scrcpy::control::ControlEvent>(100);
 
     // 创建 WebSocket 服务器（自动寻找可用端口）
     let ws_server = WebSocketServer::new(args.ws_port, idr_request_tx, control_tx, device_width, device_height)?;
@@ -286,7 +286,21 @@ async fn main() -> Result<()> {
             // 处理控制事件
             Some(control_event) = control_rx.recv() => {
                 debug!("🎮 Received control event: {:?}", control_event);
-                if let Err(e) = control_channel.send_touch_event(&control_event).await {
+                let result = match control_event {
+                    scrcpy::control::ControlEvent::Touch(touch) => {
+                        control_channel.send_touch_event(&touch).await
+                    }
+                    scrcpy::control::ControlEvent::Key(key) => {
+                        control_channel.send_key_event(&key).await
+                    }
+                    scrcpy::control::ControlEvent::Text(text) => {
+                        control_channel.send_text(&text.text).await
+                    }
+                    scrcpy::control::ControlEvent::Clipboard(clip) => {
+                        control_channel.set_clipboard(&clip.text, clip.paste).await
+                    }
+                };
+                if let Err(e) = result {
                     error!("Failed to send control event to device: {}", e);
                 } else {
                     debug!("✅ Control event sent successfully");
