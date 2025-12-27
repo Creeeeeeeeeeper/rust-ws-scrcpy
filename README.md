@@ -272,43 +272,46 @@ async fn main() -> Result<()> {
 
 步骤：
 
-  1. **首次设置（需要 USB）**
-     
-      先用 USB 连接手机，然后开启 TCP/IP 模式
+1.**首次设置（需要 USB）**
+
+先用 USB 连接手机，然后开启 TCP/IP 模式
 
 ```bash
 adb tcpip 5555
 ```
 
-   	查看手机 IP 地址（在手机 设置 > 关于手机 > 状态 中查看）
-   	或者用命令：
+查看手机 IP 地址（在手机 设置 > 关于手机 > 状态 中查看）
+或者用命令：
 
 ```bash
 adb shell ip route | findstr wlan     // powershell
 ```
 
-  2. **WiFi 连接**
-      拔掉 USB，通过 WiFi 连接
+2.**WiFi 连接**
+
+拔掉 USB，通过 WiFi 连接
 ```bash
-    adb connect 192.168.1.xxx:5555
+adb connect 192.168.1.xxx:5555
 ```
 
-​		确认连接成功
+确认连接成功
 
 ```bash
 adb devices
 ```
-  3. **运行 rust-scrcpy**
-      直接运行，会自动识别 WiFi 连接的设备，注意使用 `--public` 参数
+3.**运行 rust-scrcpy**
+
+直接运行，会自动识别 WiFi 连接的设备，注意使用 `--public` 参数
 ```bash    
 rust-ws-scrcpy.exe --public
 ```
 
-   	或者指定设备
+或者指定设备
+
 ```bash
 rust-ws-scrcpy.exe -d 192.168.1.xxx:5555 --public
 ```
-  **注意事项：**
+**注意事项：**
   - 手机和电脑需要在同一局域网
   - WiFi 连接延迟会比 USB 稍高（通常增加 20-50ms）
   - 某些手机重启后需要重新开启 adb tcpip 5555
