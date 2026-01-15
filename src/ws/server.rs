@@ -117,7 +117,10 @@ impl WebSocketServer {
             }))
             .route("/", get(serve_html))
             .route("/decoder/Decoder.min.js", get(serve_broadway_decoder))
-            .route("/decoder/jmuxer.min.js", get(serve_jmuxer));
+            .route("/decoder/jmuxer.min.js", get(serve_jmuxer))
+            .route("/assets/tasks.png", get(serve_tasks_image))
+            .route("/assets/home.png", get(serve_home_image))
+            .route("/assets/back.png", get(serve_back_image));
 
         // 启动服务器
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -342,8 +345,9 @@ async fn serve_html() -> impl IntoResponse {
             margin: 0;
             padding: 0;
             overflow: hidden;
-            background: #fff;
+            background: #2C2E39;
             display: flex;
+            flex-direction: column;
             justify-content: center;
             align-items: center;
         }
@@ -361,6 +365,16 @@ async fn serve_html() -> impl IntoResponse {
             display: flex;
             justify-content: center;
             align-items: center;
+            flex-shrink: 0;
+        }
+
+        /* 主容器，包含视频和按钮 */
+        #mainContainer {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0;
         }
 
         /* 解码器状态指示器 */
@@ -494,17 +508,75 @@ async fn serve_html() -> impl IntoResponse {
             gap: 10px;
             justify-content: center;
         }
+
+        /* 底部按钮容器 */
+        #buttonContainer {
+            position: relative;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #FFFFFF;
+            padding: 8px 15px;
+            box-sizing: border-box;
+            flex-shrink: 0;
+            box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .nav-button {
+            flex: 1;
+            max-width: 80px;
+            aspect-ratio: 2 / 1;
+            background-size: contain;
+            background-repeat: no-repeat;
+            background-position: center;
+            cursor: pointer;
+            opacity: 0.7;
+            transition: opacity 0.2s, transform 0.1s;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        .nav-button:hover {
+            opacity: 1;
+        }
+
+        .nav-button:active {
+            transform: scale(0.95);
+        }
+
+        #tasksBtn {
+            background-image: url('/assets/tasks.png');
+        }
+
+        #homeBtn {
+            background-image: url('/assets/home.png');
+        }
+
+        #backBtn {
+            background-image: url('/assets/back.png');
+        }
     </style>
 </head>
 <body>
-    <!-- Canvas 容器，用于裁剪超出部分 -->
-    <div id="canvasContainer">
-        <canvas id="videoCanvas" width="1920" height="1080"></canvas>
+    <!-- 主容器，包含视频和按钮 -->
+    <div id="mainContainer">
+        <!-- Canvas 容器，用于裁剪超出部分 -->
+        <div id="canvasContainer">
+            <canvas id="videoCanvas" width="1920" height="1080"></canvas>
 
-        <!-- 解码器状态指示器 -->
-        <div id="decoderStatus" class="loading">
-            <span class="dot"></span>
-            <span id="decoderName">初始化中...</span>
+            <!-- 解码器状态指示器 -->
+            <div id="decoderStatus" class="loading">
+                <span class="dot"></span>
+                <span id="decoderName">初始化中...</span>
+            </div>
+        </div>
+
+        <!-- 底部导航按钮 -->
+        <div id="buttonContainer">
+            <div id="tasksBtn" class="nav-button" title="任务栏"></div>
+            <div id="homeBtn" class="nav-button" title="主界面"></div>
+            <div id="backBtn" class="nav-button" title="返回"></div>
         </div>
     </div>
 
@@ -1247,15 +1319,20 @@ async fn serve_html() -> impl IntoResponse {
                 const videoRatio = videoWidth / videoHeight;
                 const windowWidth = window.innerWidth;
                 const windowHeight = window.innerHeight;
-                const windowRatio = windowWidth / windowHeight;
+
+                // 动态获取按钮容器的实际高度
+                const buttonContainer = document.getElementById('buttonContainer');
+                const buttonContainerHeight = buttonContainer ? buttonContainer.offsetHeight : 60;
+                const availableHeight = windowHeight - buttonContainerHeight;
+                const windowRatio = windowWidth / availableHeight;
 
                 let canvasStyleWidth, canvasStyleHeight;
                 if (videoRatio > windowRatio) {
                     canvasStyleWidth = windowWidth;
                     canvasStyleHeight = windowWidth / videoRatio;
                 } else {
-                    canvasStyleHeight = windowHeight;
-                    canvasStyleWidth = windowHeight * videoRatio;
+                    canvasStyleHeight = availableHeight;
+                    canvasStyleWidth = availableHeight * videoRatio;
                 }
 
                 canvas.style.width = canvasStyleWidth + 'px';
@@ -1264,6 +1341,9 @@ async fn serve_html() -> impl IntoResponse {
                 // 同步设置容器尺寸
                 container.style.width = canvasStyleWidth + 'px';
                 container.style.height = canvasStyleHeight + 'px';
+
+                // 设置按钮容器宽度与 canvas 一致
+                buttonContainer.style.width = canvasStyleWidth + 'px';
 
                 // 重新加载位置以适应新尺寸
                 loadStatusPosition();
@@ -1679,10 +1759,124 @@ async fn serve_html() -> impl IntoResponse {
             canvas.addEventListener('wheel', handleWheel, { passive: false });
         }
 
+        // ========== Android 系统按键常量 ==========
+        const KEYCODE_BACK = 4;      // 返回键
+        const KEYCODE_HOME = 3;      // Home键
+        const KEYCODE_APP_SWITCH = 187;  // 任务切换键（Recent Apps）
+
+        // ========== 导航按钮处理 ==========
+        function sendAndroidKey(keycode) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            // 发送按下事件
+            ws.send(JSON.stringify({
+                type: 'key',
+                action: 0,  // ACTION_DOWN
+                keycode: keycode,
+                repeat: 0,
+                metastate: 0
+            }));
+            // 发送抬起事件
+            setTimeout(() => {
+                ws.send(JSON.stringify({
+                    type: 'key',
+                    action: 1,  // ACTION_UP
+                    keycode: keycode,
+                    repeat: 0,
+                    metastate: 0
+                }));
+            }, 50);
+        }
+
+        function setupNavigationButtons() {
+            const tasksBtn = document.getElementById('tasksBtn');
+            const homeBtn = document.getElementById('homeBtn');
+            const backBtn = document.getElementById('backBtn');
+
+            // 返回按钮
+            backBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                sendAndroidKey(KEYCODE_BACK);
+                console.log('📱 Back button pressed');
+            });
+
+            // Home按钮（支持长按打开任务栏）
+            let homeLongPressTimer = null;
+            let homeLongPressed = false;
+
+            homeBtn.addEventListener('mousedown', (e) => {
+                e.stopPropagation();
+                homeLongPressed = false;
+                homeLongPressTimer = setTimeout(() => {
+                    homeLongPressed = true;
+                    sendAndroidKey(KEYCODE_APP_SWITCH);
+                    console.log('📱 Home long press - opening recent apps');
+                }, 500);  // 长按500毫秒
+            });
+
+            homeBtn.addEventListener('mouseup', (e) => {
+                e.stopPropagation();
+                if (homeLongPressTimer) {
+                    clearTimeout(homeLongPressTimer);
+                    homeLongPressTimer = null;
+                }
+                if (!homeLongPressed) {
+                    sendAndroidKey(KEYCODE_HOME);
+                    console.log('📱 Home button pressed');
+                }
+            });
+
+            homeBtn.addEventListener('mouseleave', () => {
+                if (homeLongPressTimer) {
+                    clearTimeout(homeLongPressTimer);
+                    homeLongPressTimer = null;
+                }
+            });
+
+            // Home按钮触摸事件（移动设备）
+            homeBtn.addEventListener('touchstart', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                homeLongPressed = false;
+                homeLongPressTimer = setTimeout(() => {
+                    homeLongPressed = true;
+                    sendAndroidKey(KEYCODE_APP_SWITCH);
+                    console.log('📱 Home long press - opening recent apps');
+                }, 500);
+            });
+
+            homeBtn.addEventListener('touchend', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                if (homeLongPressTimer) {
+                    clearTimeout(homeLongPressTimer);
+                    homeLongPressTimer = null;
+                }
+                if (!homeLongPressed) {
+                    sendAndroidKey(KEYCODE_HOME);
+                    console.log('📱 Home button pressed');
+                }
+            });
+
+            homeBtn.addEventListener('touchcancel', () => {
+                if (homeLongPressTimer) {
+                    clearTimeout(homeLongPressTimer);
+                    homeLongPressTimer = null;
+                }
+            });
+
+            // 任务栏按钮
+            tasksBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                sendAndroidKey(KEYCODE_APP_SWITCH);
+                console.log('📱 Tasks button pressed');
+            });
+        }
+
         // ========== 初始化 ==========
         setupTouchEvents();
         setupKeyboardEvents();
         setupScrollEvents();
+        setupNavigationButtons();
         connect();
     </script>
 </body>
@@ -1702,4 +1896,22 @@ async fn serve_broadway_decoder() -> impl IntoResponse {
 async fn serve_jmuxer() -> impl IntoResponse {
     let js = include_str!("../decoder/jmuxer.min.js");
     ([("content-type", "application/javascript; charset=utf-8")], js)
+}
+
+/// 提供 tasks 按钮图片
+async fn serve_tasks_image() -> impl IntoResponse {
+    let image = include_bytes!("../assets/tasks.png");
+    ([("content-type", "image/png")], image.as_ref())
+}
+
+/// 提供 home 按钮图片
+async fn serve_home_image() -> impl IntoResponse {
+    let image = include_bytes!("../assets/home.png");
+    ([("content-type", "image/png")], image.as_ref())
+}
+
+/// 提供 back 按钮图片
+async fn serve_back_image() -> impl IntoResponse {
+    let image = include_bytes!("../assets/back.png");
+    ([("content-type", "image/png")], image.as_ref())
 }
