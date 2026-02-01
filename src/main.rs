@@ -791,7 +791,7 @@ fn parse_sps_resolution(sps_data: &[u8]) -> Option<(u32, u32)> {
     let final_width = width - crop_left - crop_right;
     let final_height = height - crop_top - crop_bottom;
 
-    info!("📐 SPS parsed resolution: {}x{} (before crop: {}x{})", final_width, final_height, width, height);
+    debug!("📐 SPS parsed resolution: {}x{} (before crop: {}x{})", final_width, final_height, width, height);
 
     Some((final_width, final_height))
 }
