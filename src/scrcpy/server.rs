@@ -37,6 +37,7 @@ pub struct ScrcpyServer {
     bit_rate: u32,
     max_fps: u32,
     intra_refresh_period: u32,  // 强制IDR帧间隔（秒）
+    video_encoder: Option<String>,  // 指定视频编码器
     server_process: Option<Child>,
 }
 
@@ -58,6 +59,7 @@ impl ScrcpyServer {
             bit_rate: 16_000_000, // 16Mbps - 提高码率改善画质
             max_fps: 60,
             intra_refresh_period: 1,  // 每1秒强制一个IDR帧
+            video_encoder: None,
             server_process: None,
         })
     }
@@ -73,6 +75,7 @@ impl ScrcpyServer {
         video_port: u16,
         control_port: u16,
         intra_refresh_period: u32,
+        video_encoder: Option<String>,
     ) -> Result<Self> {
         // 自动寻找可用端口
         let actual_video_port = find_available_port(video_port, 100)?;
@@ -94,6 +97,7 @@ impl ScrcpyServer {
             bit_rate,
             max_fps,
             intra_refresh_period,
+            video_encoder,
             server_process: None,
         })
     }
@@ -166,14 +170,25 @@ impl ScrcpyServer {
         // i-frame-interval 单位是秒
 
         info!("  IDR frame interval: {}s", self.intra_refresh_period);
+        if let Some(ref encoder) = self.video_encoder {
+            info!("  Video encoder: {}", encoder);
+        }
 
         // scrcpy v3.3.4 参数 (按照 SUMMARY.md 的工作配置)
+        // 强制使用 h264 编码，确保模拟器兼容性
+        let encoder_param = match &self.video_encoder {
+            Some(encoder) => format!("video_encoder={} ", encoder),
+            None => String::new(),
+        };
+
         let server_args = format!(
             "CLASSPATH={} app_process / com.genymobile.scrcpy.Server 3.3.4 \
              log_level=info \
              max_size={} \
              video_bit_rate={} \
              max_fps={} \
+             video_codec=h264 \
+             {}\
              video_codec_options=i-frame-interval={} \
              tunnel_forward=true \
              send_device_meta=false \
@@ -188,6 +203,7 @@ impl ScrcpyServer {
             self.max_size,
             self.bit_rate,
             self.max_fps,
+            encoder_param,
             self.intra_refresh_period
         );
 

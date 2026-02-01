@@ -4,13 +4,10 @@
   <img width="220"
        src="https://github.com/user-attachments/assets/4f6ab07c-c84e-43bc-a889-0d07eb22db18" />
 </p>
-
 <p align="center">
-  <sub>🦀 Rust grabs Android 🤖</sub><br/>
-  <sub style="color: #6a737d;">
-    and talks to it through scrcpy & WebSocket
-  </sub>
+  <sub>🦀 && 🤖</sub><br/>
 </p>
+
 
 
 ## 目录
@@ -1671,7 +1668,8 @@ if frame.frame_type == FrameType::Config {
 | ------------------------ | ------ | --------------------------------------- | ---------------------------- |
 | `--adb-path`             | `-a`   | `../adb/adb.exe`                        | ADB 可执行文件路径           |
 | `--server-path`          | `-s`   | `../scrcpy-server/scrcpy-server-v3.3.4` | scrcpy-server JAR 路径       |
-| `--device`               | `-d`   | (自动选择)                              | 目标设备序列号               |
+| `--list`                 |        | (不启用)                                | 列出所有已连接设备并退出     |
+| `--device`               | `-d`   | (自动选择)                              | 目标设备索引或序列号         |
 | `--max-size`             | `-m`   | `1920`                                  | 最大视频分辨率               |
 | `--bit-rate`             | `-b`   | `4000000`                               | 视频码率 (bps)               |
 | `--max-fps`              | `-f`   | `60`                                    | 最大帧率                     |
@@ -1679,6 +1677,7 @@ if frame.frame_type == FrameType::Config {
 | `--video-port`           |        | `27183`                                 | 视频流端口                   |
 | `--control-port`         |        | `27184`                                 | 控制流端口                   |
 | `--intra-refresh-period` | `-i`   | `1`                                     | IDR 帧间隔 (秒)              |
+| `--video-encoder`        | `-e`   | (自动选择)                              | 指定视频编码器名称           |
 | `--log-level`            | `-l`   | `info`                                  | 日志级别                     |
 | `--public`               |        | (不启用)                                | 启用局域网访问 (0.0.0.0)     |
 
@@ -1703,6 +1702,150 @@ if frame.frame_type == FrameType::Config {
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 12.3 模拟器兼容性说明
+
+部分 Android 模拟器（如雷电模拟器）使用 x86 架构，其视频编码器采用 Baseline Profile，压缩效率比真机/ARM 模拟器的 High Profile 低约 30-40%。
+
+**问题表现：**
+- 画面卡顿、延迟高
+- CPU 占用较高
+
+**解决方案：**
+
+1. **降低分辨率和码率（推荐）**
+   ```bash
+   rust-scrcpy.exe -m 1080 -b 2000000
+   ```
+
+2. **进一步降低参数**
+   ```bash
+   rust-scrcpy.exe -m 720 -b 1000000
+   ```
+
+3. **指定编码器**（查看可用编码器：`adb shell "dumpsys media.codec | grep -i avc"`）
+   ```bash
+   rust-scrcpy.exe -m 1080 -b 2000000 -e c2.android.avc.encoder
+   ```
+
+4. **降低帧率换取更高分辨率**
+   ```bash
+   rust-scrcpy.exe -m 1080 -b 2000000 -f 30
+   ```
+
+**技术细节：**
+- 程序会根据 SPS 中的 profile_idc 自动配置 WebCodecs 解码器
+- Baseline Profile (66): `avc1.42xxxx`
+- High Profile (100): `avc1.64xxxx`
+
+### 12.4 雷电模拟器适配技术细节
+
+为支持雷电模拟器等 x86 架构模拟器，进行了以下技术改进：
+
+#### 12.4.1 SPS 防竞争字节处理
+
+H.264 SPS 数据中可能包含防竞争字节 (Emulation Prevention Bytes)，即 `0x00 0x00 0x03` 序列。雷电模拟器的 SPS 包含此类字节，导致解析偏移错误。
+
+```rust
+// src/main.rs - 移除防竞争字节
+fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 2 < data.len() && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03 {
+            result.push(0x00);
+            result.push(0x00);
+            i += 3; // 跳过 0x03
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    result
+}
+```
+
+#### 12.4.2 动态 Codec 检测
+
+前端 WebCodecs 解码器根据 SPS 中的 profile_idc 动态配置 codec string：
+
+```javascript
+// 从 SPS 解析 codec string
+reconfigureFromSPS(spsData) {
+    // SPS 格式: 00 00 00 01 [NAL header] [profile_idc] [constraint_flags] [level_idc]
+    const profileIdc = spsData[5];
+    const constraintFlags = spsData[6];
+    const levelIdc = spsData[7];
+
+    // 构建 codec string: avc1.XXYYZZ
+    const codecString = `avc1.${profileIdc.toString(16).padStart(2, '0')}${constraintFlags.toString(16).padStart(2, '0')}${levelIdc.toString(16).padStart(2, '0')}`;
+
+    this.decoder.configure({
+        codec: codecString,
+        optimizeForLatency: true,
+        hardwareAcceleration: 'prefer-hardware',
+    });
+}
+```
+
+#### 12.4.3 IDR 帧缓存机制
+
+新客户端连接时，由于 broadcast channel 缓冲有限，可能错过 IDR 帧导致画面无法显示。解决方案是缓存最后一个 IDR 帧：
+
+```rust
+// src/main.rs - 缓存 IDR 帧
+if nal_type == 5 {
+    let video_config_clone = video_config.clone();
+    let idr_clone = nal_bytes.clone();
+    tokio::spawn(async move {
+        let mut config = video_config_clone.write().await;
+        config.last_idr = Some(idr_clone);
+    });
+}
+
+// src/ws/server.rs - 新客户端连接时发送缓存的 SPS + PPS + IDR
+if let Some(idr) = &config.last_idr {
+    socket.send(Message::Binary(idr.to_vec())).await;
+}
+```
+
+#### 12.4.4 视频流批量读取优化
+
+原实现逐字节读取视频流效率低下，改为批量读取：
+
+```rust
+// src/scrcpy/video.rs - 批量读取
+pub async fn read_frame(&mut self, _with_meta: bool) -> Result<Option<VideoFrame>> {
+    let mut read_buf = [0u8; 8192];  // 8KB 批量读取
+
+    loop {
+        if let Some(nal) = self.try_extract_nal() {
+            return Ok(Some(nal));
+        }
+
+        match self.stream.read(&mut read_buf).await {
+            Ok(0) => return Ok(None),
+            Ok(n) => self.buffer.extend_from_slice(&read_buf[..n]),
+            Err(e) => return Err(...),
+        }
+    }
+}
+```
+
+#### 12.4.5 修改汇总
+
+| 文件 | 修改内容 |
+|------|----------|
+| `src/main.rs` | 添加 `remove_emulation_prevention_bytes()` 函数处理 SPS |
+| `src/main.rs` | 添加 `--video-encoder` 命令行参数 |
+| `src/main.rs` | 缓存 IDR 帧用于新客户端快速显示 |
+| `src/scrcpy/server.rs` | 添加 `video_encoder` 参数支持 |
+| `src/scrcpy/video.rs` | 视频流读取从逐字节改为 8KB 批量读取 |
+| `src/ws/server.rs` | `VideoConfig` 添加 `last_idr` 字段 |
+| `src/ws/server.rs` | 新客户端连接时发送 SPS + PPS + IDR |
+| `src/ws/server.rs` | broadcast channel 缓冲从 2 增加到 60 |
+| `src/ws/server.rs` | 前端 WebCodecs 解码器动态配置 codec string |
+| `src/ws/server.rs` | 导航按钮大小改为较短边的 0.1 倍 |
 
 ---
 

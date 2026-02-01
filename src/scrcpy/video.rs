@@ -4,6 +4,21 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+/// 在缓冲区中查找起始码 00 00 01 的位置
+/// 返回起始码第一个字节的位置
+fn find_start_code(buf: &[u8], start: usize) -> Option<usize> {
+    if buf.len() < start + 3 {
+        return None;
+    }
+
+    for i in start..buf.len() - 2 {
+        if buf[i] == 0x00 && buf[i + 1] == 0x00 && buf[i + 2] == 0x01 {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// 视频帧类型
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameType {
@@ -67,20 +82,31 @@ impl VideoStreamReader {
     /// scrcpy 3.3.4 raw_stream=true 模式：
     /// 直接的 Annex-B H.264 NAL 流，使用 00 00 01 或 00 00 00 01 起始码分隔
     pub async fn read_frame(&mut self, _with_meta: bool) -> Result<Option<VideoFrame>> {
+        // 批量读取缓冲区
+        let mut read_buf = [0u8; 8192];
+
         loop {
-            // 逐字节读取
-            let mut byte = [0u8; 1];
-            match self.stream.read_exact(&mut byte).await {
-                Ok(_) => {
-                    self.buffer.extend_from_slice(&byte);
+            // 首先检查现有缓冲区中是否已有完整的 NAL 单元
+            if let Some(nal) = self.try_extract_nal() {
+                return Ok(Some(nal));
+            }
+
+            // 批量读取数据
+            match self.stream.read(&mut read_buf).await {
+                Ok(0) => {
+                    debug!("Stream closed (EOF)");
+                    return Ok(None);
+                }
+                Ok(n) => {
+                    self.buffer.extend_from_slice(&read_buf[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     debug!("Stream closed (EOF)");
                     return Ok(None);
                 }
                 Err(e) => {
-                    warn!("Failed to read byte: {}", e);
-                    return Err(ScrcpyError::VideoStream(format!("Failed to read byte: {}", e)));
+                    warn!("Failed to read: {}", e);
+                    return Err(ScrcpyError::VideoStream(format!("Failed to read: {}", e)));
                 }
             }
 
@@ -89,62 +115,85 @@ impl VideoStreamReader {
                 warn!("Buffer overflow, clearing");
                 self.buffer.clear();
                 self.first_start_code_pos = None;
-                continue;
-            }
-
-            // 查找 3-byte 起始码 00 00 01
-            let buf_len = self.buffer.len();
-            if buf_len >= 3 {
-                let last_3 = &self.buffer[buf_len - 3..];
-
-                if last_3 == [0x00, 0x00, 0x01] {
-                    // 找到一个起始码
-
-                    if self.first_start_code_pos.is_none() {
-                        // 这是第一个起始码，记录位置
-                        self.first_start_code_pos = Some(buf_len - 3);
-                        continue;
-                    } else {
-                        // 这是第二个起始码，提取中间的NAL单元
-                        let start_pos = self.first_start_code_pos.unwrap();
-
-                        // NAL数据从第一个起始码之后开始，到第二个起始码之前结束
-                        // 跳过起始码本身(3字节)，提取NAL数据
-                        let nal_start = start_pos + 3;
-                        let nal_end = buf_len - 3;
-
-                        if nal_start >= nal_end {
-                            // 两个起始码相邻，没有数据
-                            self.first_start_code_pos = Some(buf_len - 3);
-                            continue;
-                        }
-
-                        let nal_data = self.buffer[nal_start..nal_end].to_vec();
-
-                        // 清除已处理的数据，保留第二个起始码
-                        self.buffer = BytesMut::from(&self.buffer[buf_len - 3..]);
-                        self.first_start_code_pos = Some(0);  // 新的起始码现在在位置0
-
-                        // 解析 NAL 类型
-                        let nal_type = nal_data[0] & 0x1F;
-
-                        let frame_type = if matches!(nal_type, 7 | 8) {
-                            FrameType::Config
-                        } else {
-                            FrameType::Video
-                        };
-
-                        self.frame_count += 1;
-
-                        return Ok(Some(VideoFrame::new(
-                            0, // raw_stream 模式没有 PTS
-                            frame_type,
-                            Bytes::from(nal_data),
-                        )));
-                    }
-                }
             }
         }
+    }
+
+    /// 尝试从缓冲区提取一个完整的 NAL 单元
+    fn try_extract_nal(&mut self) -> Option<VideoFrame> {
+        let buf = &self.buffer[..];
+        let buf_len = buf.len();
+
+        if buf_len < 4 {
+            return None;
+        }
+
+        // 查找第一个起始码
+        let first_pos = if self.first_start_code_pos.is_some() {
+            self.first_start_code_pos.unwrap()
+        } else {
+            // 查找第一个 00 00 01 或 00 00 00 01
+            let pos = find_start_code(buf, 0)?;
+            self.first_start_code_pos = Some(pos);
+            pos
+        };
+
+        // 从第一个起始码之后查找第二个起始码
+        let search_start = first_pos + 3;
+        if search_start >= buf_len {
+            return None;
+        }
+
+        let second_pos = find_start_code(buf, search_start)?;
+
+        // 提取 NAL 单元（不包含起始码）
+        let nal_start = first_pos + 3;
+        // 处理 4 字节起始码的情况
+        let nal_start = if first_pos > 0 && buf[first_pos - 1] == 0x00 {
+            first_pos + 3  // 已经跳过了 00 00 01
+        } else {
+            nal_start
+        };
+
+        let nal_end = if second_pos > 0 && buf[second_pos - 1] == 0x00 {
+            second_pos - 1  // 4 字节起始码，回退一位
+        } else {
+            second_pos
+        };
+
+        if nal_start >= nal_end {
+            // 两个起始码相邻，没有数据，移动到下一个
+            self.buffer = BytesMut::from(&buf[second_pos..]);
+            self.first_start_code_pos = Some(0);
+            return None;
+        }
+
+        let nal_data = buf[nal_start..nal_end].to_vec();
+
+        // 更新缓冲区，保留从第二个起始码开始的数据
+        self.buffer = BytesMut::from(&buf[second_pos..]);
+        self.first_start_code_pos = Some(0);
+
+        // 解析 NAL 类型
+        if nal_data.is_empty() {
+            return None;
+        }
+
+        let nal_type = nal_data[0] & 0x1F;
+
+        let frame_type = if matches!(nal_type, 7 | 8) {
+            FrameType::Config
+        } else {
+            FrameType::Video
+        };
+
+        self.frame_count += 1;
+
+        Some(VideoFrame::new(
+            0,
+            frame_type,
+            Bytes::from(nal_data),
+        ))
     }
 
     /// 获取已接收的帧数

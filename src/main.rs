@@ -20,7 +20,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "Rust-ws-scrcpy")]
 #[command(author = "zzzzyg")]
-#[command(version = "2.1.2")]
+#[command(version = "2.2.0")]
 #[command(about = "Stream Android device screen to web browsers via WebSocket", long_about = None)]
 #[command(help_template = "{name} {version}\nAuthor: {author}\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}")]
 struct Args {
@@ -36,9 +36,16 @@ struct Args {
     #[arg(short, long, default_value = "../scrcpy-server/scrcpy-server-v3.3.4")]
     server_path: PathBuf,
 
-    /// Target device serial number (use first device if not specified)
+    /// List all connected devices and exit
     ///
-    /// 目标设备序列号（不指定则使用第一个设备）
+    /// 列出所有已连接的设备并退出
+    #[arg(long)]
+    list: bool,
+
+    /// Target device index or serial number (use first device if not specified)
+    /// Use --list to see device indices
+    ///
+    /// 目标设备索引或序列号（不指定则使用第一个设备），使用 --list 查看设备索引
     #[arg(short, long)]
     device: Option<String>,
 
@@ -83,6 +90,13 @@ struct Args {
     /// 帧内刷新周期（秒）- IDR 关键帧间隔
     #[arg(short = 'i', long, default_value = "1")]
     intra_refresh_period: u32,
+
+    /// Video encoder name (e.g., OMX.google.h264.encoder, c2.android.avc.encoder)
+    /// Use 'adb shell dumpsys media.codec' to list available encoders
+    ///
+    /// 视频编码器名称，留空则自动选择
+    #[arg(short = 'e', long)]
+    video_encoder: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
     ///
@@ -156,18 +170,40 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    info!("✅ Found {} device(s):", devices.len());
-    for device in &devices {
-        info!("  - {}", device);
+    // 如果指定了 --list，列出设备并退出
+    if args.list {
+        println!("📱 Connected devices:");
+        for (index, device) in devices.iter().enumerate() {
+            println!("  [{}] {}", index, device);
+        }
+        println!("\nUse -d <index> or -d <serial> to select a device");
+        return Ok(());
     }
 
-    // 选择设备
-    let device_id = if let Some(device) = args.device {
-        if !devices.contains(&device) {
-            eprintln!("❌ Device {} not found in connected devices", device);
-            return Ok(());
+    info!("✅ Found {} device(s):", devices.len());
+    for (index, device) in devices.iter().enumerate() {
+        info!("  [{}] {}", index, device);
+    }
+
+    // 选择设备（支持索引或序列号）
+    let device_id = if let Some(device_arg) = args.device {
+        // 尝试解析为索引
+        if let Ok(index) = device_arg.parse::<usize>() {
+            if index < devices.len() {
+                devices[index].clone()
+            } else {
+                eprintln!("❌ Device index {} out of range (0-{})", index, devices.len() - 1);
+                return Ok(());
+            }
+        } else {
+            // 作为序列号处理
+            if !devices.contains(&device_arg) {
+                eprintln!("❌ Device '{}' not found in connected devices", device_arg);
+                eprintln!("Use --list to see available devices");
+                return Ok(());
+            }
+            device_arg
         }
-        device
     } else {
         devices[0].clone()
     };
@@ -203,6 +239,7 @@ async fn main() -> Result<()> {
         args.video_port,
         args.control_port,
         args.intra_refresh_period,
+        args.video_encoder,
     )?;
 
     // 部署服务器
@@ -286,6 +323,7 @@ async fn main() -> Result<()> {
     let mut sps_cached = false;
     let mut pps_cached = false;
     let mut pending_idr_request = false;
+    let mut last_idr_cache: Option<Bytes> = None; // 本地缓存 IDR，减少锁竞争
 
     // 持续接收并广播视频帧
     loop {
@@ -326,9 +364,9 @@ async fn main() -> Result<()> {
                 debug!("🎬 Received IDR request from new client");
                 pending_idr_request = true;
 
-                // 立即重新发送缓存的SPS/PPS
+                // 立即重新发送缓存的SPS/PPS和IDR
                 if sps_cached {
-                    // 获取当前缓存的SPS并重新广播
+                    // 获取当前缓存的SPS/PPS并重新广播
                     let config = video_config.read().await;
                     if let Some(sps) = &config.sps {
                         let _ = frame_sender.send(sps.clone());
@@ -337,6 +375,10 @@ async fn main() -> Result<()> {
                         let _ = frame_sender.send(pps.clone());
                     }
                     drop(config);
+                }
+                // 使用本地缓存的 IDR 避免锁竞争
+                if let Some(ref idr) = last_idr_cache {
+                    let _ = frame_sender.send(idr.clone());
                 }
             }
 
@@ -373,17 +415,35 @@ async fn main() -> Result<()> {
 
                                 // 解析 SPS 获取分辨率，检测横竖屏变化
                                 let mut should_broadcast = false;
-                                if let Some((width, height)) = parse_sps_resolution(&frame.data) {
-                                    let new_is_landscape = width > height;
-                                    let resolution_changed = config.width != width || config.height != height;
-                                    let orientation_changed = config.is_landscape != new_is_landscape;
+                                match parse_sps_resolution(&frame.data) {
+                                    Some((width, height)) => {
+                                        debug!("SPS parsed: {}x{}, current config: {}x{}",
+                                            width, height, config.width, config.height);
+                                        let new_is_landscape = width > height;
+                                        let resolution_changed = config.width != width || config.height != height;
+                                        let orientation_changed = config.is_landscape != new_is_landscape;
 
-                                    if resolution_changed || orientation_changed {
-                                        config.width = width;
-                                        config.height = height;
-                                        config.is_landscape = new_is_landscape;
-                                        should_broadcast = true;
-                                        info!("🔄 Resolution changed: {}x{}, Landscape: {}", width, height, new_is_landscape);
+                                        if resolution_changed || orientation_changed {
+                                            config.width = width;
+                                            config.height = height;
+                                            config.is_landscape = new_is_landscape;
+                                            should_broadcast = true;
+                                            info!("🔄 Resolution changed: {}x{}, Landscape: {}", width, height, new_is_landscape);
+                                        } else {
+                                            debug!("SPS resolution matches current config, no change needed");
+                                        }
+                                    }
+                                    None => {
+                                        // SPS 解析失败，使用设备物理分辨率作为后备
+                                        warn!("⚠️ Failed to parse SPS resolution, using device resolution as fallback");
+                                        if config.width == 0 || config.height == 0 {
+                                            config.width = config.device_width;
+                                            config.height = config.device_height;
+                                            config.is_landscape = config.device_width > config.device_height;
+                                            should_broadcast = true;
+                                            info!("🔄 Using device resolution: {}x{}, Landscape: {}",
+                                                config.width, config.height, config.is_landscape);
+                                        }
                                     }
                                 }
 
@@ -420,9 +480,24 @@ async fn main() -> Result<()> {
                         // 构建完整的 NAL 单元（包含起始码）
                         let mut nal_with_start_code = vec![0x00, 0x00, 0x00, 0x01];
                         nal_with_start_code.extend_from_slice(&frame.data);
+                        let nal_bytes = Bytes::from(nal_with_start_code);
+
+                        // 缓存 IDR 帧，用于新客户端连接时立即发送
+                        let nal_type = frame.data[0] & 0x1F;
+                        if nal_type == 5 {
+                            // 先更新本地缓存
+                            last_idr_cache = Some(nal_bytes.clone());
+                            // 异步更新共享缓存（不阻塞主循环）
+                            let video_config_clone = video_config.clone();
+                            let idr_clone = nal_bytes.clone();
+                            tokio::spawn(async move {
+                                let mut config = video_config_clone.write().await;
+                                config.last_idr = Some(idr_clone);
+                            });
+                        }
 
                         // 广播给所有连接的 WebSocket 客户端
-                        let _ = frame_sender.send(Bytes::from(nal_with_start_code));
+                        let _ = frame_sender.send(nal_bytes);
 
                         frame_counter += 1;
 
@@ -546,19 +621,57 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// 移除 H.264 NAL 单元中的防竞争字节 (Emulation Prevention Bytes)
+/// H.264 规范中，为了防止在 NAL 数据中出现起始码 0x000001，
+/// 编码器会在 0x000000、0x000001、0x000002、0x000003 前插入 0x03
+/// 解析时需要移除这些 0x03 字节
+fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+
+    while i < data.len() {
+        // 检查是否是 0x00 0x00 0x03 序列
+        if i + 2 < data.len() && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03 {
+            // 保留前两个 0x00，跳过 0x03
+            result.push(0x00);
+            result.push(0x00);
+            i += 3; // 跳过 0x00 0x00 0x03
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
 // 解析 H.264 SPS 获取分辨率
 fn parse_sps_resolution(sps_data: &[u8]) -> Option<(u32, u32)> {
     if sps_data.len() < 4 {
+        warn!("SPS too short: {} bytes", sps_data.len());
         return None;
     }
 
-    let mut reader = BitReader::new(sps_data);
+    // 移除防竞争字节后再解析
+    let clean_data = remove_emulation_prevention_bytes(sps_data);
+
+    // 打印 SPS 原始数据（前20字节）用于调试
+    let preview_len = std::cmp::min(sps_data.len(), 20);
+    debug!("SPS raw data ({} bytes): {:02x?}", sps_data.len(), &sps_data[..preview_len]);
+    if clean_data.len() != sps_data.len() {
+        debug!("SPS after removing EPB ({} bytes): {:02x?}", clean_data.len(), &clean_data[..std::cmp::min(clean_data.len(), 20)]);
+    }
+
+    let mut reader = BitReader::new(&clean_data);
 
     // NAL header (1 byte): forbidden_zero_bit(1) + nal_ref_idc(2) + nal_unit_type(5)
-    reader.read_bits(8)?;
+    let nal_header = reader.read_bits(8)?;
+    let nal_type = nal_header & 0x1F;
+    debug!("SPS NAL header: 0x{:02x}, type={}", nal_header, nal_type);
 
     // profile_idc (8 bits)
     let profile_idc = reader.read_bits(8)?;
+    debug!("SPS profile_idc: {}", profile_idc);
 
     // constraint flags (8 bits)
     reader.read_bits(8)?;
@@ -639,16 +752,20 @@ fn parse_sps_resolution(sps_data: &[u8]) -> Option<(u32, u32)> {
 
     // pic_width_in_mbs_minus1
     let pic_width_in_mbs_minus1 = reader.read_ue()?;
+    debug!("SPS pic_width_in_mbs_minus1: {}", pic_width_in_mbs_minus1);
 
     // pic_height_in_map_units_minus1
     let pic_height_in_map_units_minus1 = reader.read_ue()?;
+    debug!("SPS pic_height_in_map_units_minus1: {}", pic_height_in_map_units_minus1);
 
     // frame_mbs_only_flag
     let frame_mbs_only_flag = reader.read_bits(1)?;
+    debug!("SPS frame_mbs_only_flag: {}", frame_mbs_only_flag);
 
     // 计算实际分辨率
     let width = (pic_width_in_mbs_minus1 + 1) * 16;
     let height = (pic_height_in_map_units_minus1 + 1) * 16 * (2 - frame_mbs_only_flag);
+    debug!("SPS calculated resolution: {}x{}", width, height);
 
     // 读取 frame_cropping_flag 来调整最终尺寸
     if frame_mbs_only_flag == 0 {
@@ -673,6 +790,8 @@ fn parse_sps_resolution(sps_data: &[u8]) -> Option<(u32, u32)> {
 
     let final_width = width - crop_left - crop_right;
     let final_height = height - crop_top - crop_bottom;
+
+    info!("📐 SPS parsed resolution: {}x{} (before crop: {}x{})", final_width, final_height, width, height);
 
     Some((final_width, final_height))
 }

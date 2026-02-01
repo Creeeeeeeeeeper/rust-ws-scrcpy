@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub struct VideoConfig {
     pub sps: Option<Bytes>,
     pub pps: Option<Bytes>,
+    pub last_idr: Option<Bytes>,  // 缓存最后一个 IDR 帧，用于新客户端快速显示
     pub width: u32,           // 视频流分辨率（可能经过缩放）
     pub height: u32,          // 视频流分辨率（可能经过缩放）
     pub device_width: u32,    // 设备物理屏幕宽度（用于触控）
@@ -52,12 +53,13 @@ impl WebSocketServer {
         // 自动寻找可用端口
         let actual_port = find_available_port(port, 100)?;
 
-        let (tx, _rx) = broadcast::channel(2); // 极小缓冲：只保留1-2帧，最小化延迟
+        let (tx, _rx) = broadcast::channel(60); // 增大缓冲区，约1秒的帧数，减少丢帧
         let (config_tx, _) = broadcast::channel(16); // 配置变化广播通道
 
         let video_config = Arc::new(RwLock::new(VideoConfig {
             sps: None,
             pps: None,
+            last_idr: None,
             width: device_width,   // 使用设备分辨率作为初始值
             height: device_height, // 使用设备分辨率作为初始值
             device_width,   // 设备物理屏幕尺寸
@@ -194,6 +196,16 @@ async fn handle_client(
         }
     } else {
         info!("⚠️  No PPS cached yet");
+    }
+    // 发送缓存的最后一个 IDR 帧，让新客户端立即显示画面
+    if let Some(idr) = &config.last_idr {
+        info!("📤 Sending cached IDR to new client ({} bytes)", idr.len());
+        if socket.send(Message::Binary(idr.to_vec())).await.is_err() {
+            warn!("Failed to send IDR to client");
+            return;
+        }
+    } else {
+        info!("⚠️  No IDR cached yet");
     }
 
     drop(config); // 释放读锁
@@ -365,7 +377,8 @@ async fn serve_html() -> impl IntoResponse {
             display: flex;
             justify-content: center;
             align-items: center;
-            flex-shrink: 0;
+            flex: 1;
+            min-height: 0;
         }
 
         /* 主容器，包含视频和按钮 */
@@ -375,6 +388,9 @@ async fn serve_html() -> impl IntoResponse {
             align-items: center;
             justify-content: center;
             gap: 0;
+            width: 100%;
+            height: 100%;
+            max-height: 100vh;
         }
 
         /* 解码器状态指示器 */
@@ -525,7 +541,6 @@ async fn serve_html() -> impl IntoResponse {
 
         .nav-button {
             flex: 1;
-            max-width: 80px;
             aspect-ratio: 2 / 1;
             background-size: contain;
             background-repeat: no-repeat;
@@ -656,6 +671,7 @@ async fn serve_html() -> impl IntoResponse {
             constructor(canvas) {
                 super(canvas);
                 this.decoder = null;
+                this.pendingConfig = null;  // 等待 SPS 后再配置
             }
 
             static isSupported() {
@@ -687,8 +703,13 @@ async fn serve_html() -> impl IntoResponse {
                     }
                 });
 
+                // 使用通用的 codec string，兼容 Baseline/Main/High Profile
+                // avc1.42001E = Baseline Profile Level 3.0
+                // avc1.4D401E = Main Profile Level 3.0
+                // avc1.64001E = High Profile Level 3.0
+                // 先使用 Baseline，如果 SPS 指示不同的 profile 会重新配置
                 this.decoder.configure({
-                    codec: 'avc1.42001E',
+                    codec: 'avc1.42001f',  // Baseline Profile Level 3.1
                     optimizeForLatency: true,
                     hardwareAcceleration: 'prefer-hardware',
                 });
@@ -697,8 +718,33 @@ async fn serve_html() -> impl IntoResponse {
                 console.log('✅ WebCodecs decoder initialized');
             }
 
+            // 根据 SPS 重新配置解码器
+            reconfigureFromSPS(spsData) {
+                if (!this.decoder || spsData.length < 8) return;
+
+                // SPS 格式: 00 00 00 01 [NAL header] [profile_idc] [constraint_flags] [level_idc] ...
+                const profileIdc = spsData[5];
+                const constraintFlags = spsData[6];
+                const levelIdc = spsData[7];
+
+                // 构建 codec string: avc1.XXYYZZ
+                const codecString = `avc1.${profileIdc.toString(16).padStart(2, '0')}${constraintFlags.toString(16).padStart(2, '0')}${levelIdc.toString(16).padStart(2, '0')}`;
+
+                try {
+                    this.decoder.configure({
+                        codec: codecString,
+                        optimizeForLatency: true,
+                        hardwareAcceleration: 'prefer-hardware',
+                    });
+                } catch (e) {
+                    // 配置失败时保持原有配置
+                }
+            }
+
             decode(nalData, isKeyFrame) {
-                if (!this.decoder || !this.ready) return;
+                if (!this.decoder || !this.ready) {
+                    return;
+                }
 
                 try {
                     if (isKeyFrame && this.decoder.decodeQueueSize > 0) {
@@ -1315,8 +1361,12 @@ async fn serve_html() -> impl IntoResponse {
 
         // ========== Canvas 尺寸管理 ==========
         function resizeCanvas() {
-            if (videoWidth > 0 && videoHeight > 0) {
-                const videoRatio = videoWidth / videoHeight;
+            // 使用视频分辨率，如果还没收到则使用 canvas 默认尺寸
+            const actualWidth = videoWidth > 0 ? videoWidth : canvas.width;
+            const actualHeight = videoHeight > 0 ? videoHeight : canvas.height;
+
+            if (actualWidth > 0 && actualHeight > 0) {
+                const videoRatio = actualWidth / actualHeight;
                 const windowWidth = window.innerWidth;
                 const windowHeight = window.innerHeight;
 
@@ -1345,6 +1395,15 @@ async fn serve_html() -> impl IntoResponse {
                 // 设置按钮容器宽度与 canvas 一致
                 buttonContainer.style.width = canvasStyleWidth + 'px';
 
+                // 设置导航按钮宽度为 canvas 较短边的 0.1 倍（横屏时用高度，竖屏时用宽度）
+                const navButtons = document.querySelectorAll('.nav-button');
+                const shorterSide = Math.min(canvasStyleWidth, canvasStyleHeight);
+                const buttonWidth = shorterSide * 0.1;
+                navButtons.forEach(btn => {
+                    btn.style.width = buttonWidth + 'px';
+                    btn.style.maxWidth = buttonWidth + 'px';
+                });
+
                 // 重新加载位置以适应新尺寸
                 loadStatusPosition();
             }
@@ -1363,7 +1422,9 @@ async fn serve_html() -> impl IntoResponse {
 
         // ========== 解码处理 ==========
         function handleVideoFrame(data) {
-            if (!currentDecoder || !currentDecoder.ready) return;
+            if (!currentDecoder || !currentDecoder.ready) {
+                return;
+            }
 
             // 检查 NAL 单元类型
             let nalType = 0;
@@ -1374,6 +1435,10 @@ async fn serve_html() -> impl IntoResponse {
             // 缓存 SPS/PPS
             if (nalType === 7) {
                 cachedSPS = data;
+                // 根据 SPS 重新配置解码器
+                if (currentDecoder && currentDecoder.reconfigureFromSPS) {
+                    currentDecoder.reconfigureFromSPS(data);
+                }
                 return;
             } else if (nalType === 8) {
                 cachedPPS = data;
@@ -1877,6 +1942,18 @@ async fn serve_html() -> impl IntoResponse {
         setupKeyboardEvents();
         setupScrollEvents();
         setupNavigationButtons();
+        // 使用 requestAnimationFrame 确保 DOM 渲染完成后再进行初始缩放
+        requestAnimationFrame(() => {
+            resizeCanvas();
+        });
+        // 100ms 后再调整一次
+        setTimeout(() => {
+            resizeCanvas();
+        }, 100);
+        // 1000ms 后再调整一次，确保完全占满
+        setTimeout(() => {
+            resizeCanvas();
+        }, 1000);
         connect();
     </script>
 </body>
